@@ -1,0 +1,19 @@
+{
+  "name": "GT.Code Analytic CAD",
+  "short_name": "GT.Code CAD",
+  "description": "CAD matematico 2D con intersezioni e postprocessor Fanuc.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#080b10",
+  "theme_color": "#0b1017",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "./gtcode-logo.png",
+      "sizes": "1024x1024",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}
