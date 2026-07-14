@@ -38,6 +38,7 @@ import {
   Redo2,
   RotateCcw,
   Save,
+  Scissors,
   Settings2,
   Share2,
   Sigma,
@@ -62,15 +63,17 @@ type Curve = {
   domainMin: number;
   domainMax: number;
   samples: number;
+  trimmedPaths?: Point[][];
 };
 type Parameter = { id: string; name: string; value: number };
 type Intersection = Point & { id: string; curves: [string, string] };
 type DrawEntity =
   | { id: string; type: "point"; p: Point }
   | { id: string; type: "line"; a: Point; b: Point }
-  | { id: string; type: "circle"; c: Point; r: number };
+  | { id: string; type: "circle"; c: Point; r: number }
+  | { id: string; type: "polyline"; points: Point[]; source?: string };
 type View = { cx: number; cy: number; scale: number };
-type Tool = "select" | "pan" | "point" | "line" | "circle" | "measure" | "zoom-window";
+type Tool = "select" | "pan" | "point" | "line" | "circle" | "measure" | "zoom-window" | "trim";
 type SnapKind = "Fine" | "Medio" | "Centro" | "Intersezione" | "Vicino" | "Tangente";
 type SnapState = Record<SnapKind, boolean>;
 type SnapHit = { point: Point; kind: SnapKind } | null;
@@ -91,7 +94,7 @@ type PostSettings = {
 };
 type PlotGeometry = { curve: Curve; segments: Segment[]; points: Point[]; paths?: Point[][]; error?: string };
 
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 const COLORS = ["#ff8a1d", "#47c8ff", "#c985ff", "#73e0aa", "#f15b74", "#ffd166"];
 const DEFAULT_VIEW: View = { cx: 0, cy: 0, scale: 10 };
 const DEFAULT_PARAMS: Parameter[] = [
@@ -280,8 +283,17 @@ function compileCurve(curve: Curve, params: Record<string, number>) {
   };
 }
 
+function geometryFromPaths(curve: Curve, rawPaths: Point[][]): PlotGeometry {
+  const paths = rawPaths
+    .map((path) => path.filter(finitePoint).filter((point, index, points) => index === 0 || distance(point, points[index - 1]) > 1e-10))
+    .filter((path) => path.length > 1);
+  const segments = paths.flatMap((path) => path.slice(1).map((point, index) => ({ a: path[index], b: point })));
+  return { curve, paths, segments, points: paths.flat() };
+}
+
 function sampledGeometry(curve: Curve, params: Record<string, number>, bounds?: { xMin: number; xMax: number; yMin: number; yMax: number }): PlotGeometry {
   try {
+    if (curve.trimmedPaths?.length) return geometryFromPaths(curve, curve.trimmedPaths);
     const compiled = compileCurve(curve, params);
     const segments: Segment[] = [];
     const points: Point[] = [];
@@ -504,6 +516,146 @@ function pathLength(points: Point[]) {
   return total;
 }
 
+function pathSegments(path: Point[]): Segment[] {
+  return path.slice(1).map((point, index) => ({ a: path[index], b: point }));
+}
+
+function entityPaths(entity: DrawEntity, circleSamples = 240): Point[][] {
+  if (entity.type === "point") return [[entity.p]];
+  if (entity.type === "line") return [[entity.a, entity.b]];
+  if (entity.type === "polyline") return [entity.points];
+  return [Array.from({ length: circleSamples + 1 }, (_, index) => {
+    const angle = index / circleSamples * Math.PI * 2;
+    return { x: entity.c.x + entity.r * Math.cos(angle), y: entity.c.y + entity.r * Math.sin(angle) };
+  })];
+}
+
+function entitySegments(entity: DrawEntity): Segment[] {
+  return entityPaths(entity).flatMap(pathSegments);
+}
+
+type PathLocation = {
+  pathIndex: number;
+  segmentIndex: number;
+  point: Point;
+  distance: number;
+  position: number;
+};
+
+export function nearestPathLocation(paths: Point[][], target: Point): PathLocation | null {
+  let best: PathLocation | null = null;
+  paths.forEach((path, pathIndex) => {
+    let traversed = 0;
+    for (let segmentIndex = 0; segmentIndex < path.length - 1; segmentIndex += 1) {
+      const segment = { a: path[segmentIndex], b: path[segmentIndex + 1] };
+      const point = nearestOnSegment(target, segment);
+      const d = distance(target, point);
+      const position = traversed + distance(segment.a, point);
+      if (!best || d < best.distance) best = { pathIndex, segmentIndex, point, distance: d, position };
+      traversed += distance(segment.a, segment.b);
+    }
+  });
+  return best;
+}
+
+function pointAtPathDistance(path: Point[], position: number): Point {
+  const total = pathLength(path);
+  const target = Math.max(0, Math.min(total, position));
+  let traversed = 0;
+  for (let index = 0; index < path.length - 1; index += 1) {
+    const a = path[index];
+    const b = path[index + 1];
+    const length = distance(a, b);
+    if (target <= traversed + length || index === path.length - 2) {
+      const t = length < 1e-14 ? 0 : (target - traversed) / length;
+      return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
+    }
+    traversed += length;
+  }
+  return path[path.length - 1];
+}
+
+function slicePath(path: Point[], start: number, end: number, epsilon: number): Point[] {
+  const total = pathLength(path);
+  const a = Math.max(0, Math.min(total, start));
+  const b = Math.max(0, Math.min(total, end));
+  if (b - a <= epsilon) return [];
+  const cumulative = [0];
+  for (let index = 1; index < path.length; index += 1) cumulative.push(cumulative[index - 1] + distance(path[index - 1], path[index]));
+  const result = [pointAtPathDistance(path, a)];
+  for (let index = 1; index < path.length - 1; index += 1) {
+    if (cumulative[index] > a + epsilon && cumulative[index] < b - epsilon) result.push(path[index]);
+  }
+  result.push(pointAtPathDistance(path, b));
+  return result.filter((point, index, points) => index === 0 || distance(point, points[index - 1]) > epsilon * 0.05);
+}
+
+export function trimPathAtLocation(paths: Point[][], hit: PathLocation, cutters: Segment[], epsilon: number) {
+  const source = paths[hit.pathIndex];
+  if (!source || source.length < 2) return null;
+  const averageSegment = pathLength(source) / Math.max(1, source.length - 1);
+  const closed = source.length >= 4 && distance(source[0], source[source.length - 1]) <= Math.max(epsilon * 2, averageSegment * 1.7);
+  const path = closed && distance(source[0], source[source.length - 1]) > epsilon * 0.05 ? [...source, source[0]] : source;
+  const total = pathLength(path);
+  if (total <= epsilon) return null;
+
+  const cutPositions: number[] = [];
+  let traversed = 0;
+  const targetSegments = pathSegments(path);
+  targetSegments.forEach((targetSegment) => {
+    for (const cutter of cutters) {
+      if (!segmentBoundsOverlap(targetSegment, cutter)) continue;
+      const point = segmentIntersection(targetSegment, cutter);
+      if (!point) continue;
+      let position = traversed + distance(targetSegment.a, point);
+      if (closed && (position <= epsilon || total - position <= epsilon)) position = 0;
+      if (!cutPositions.some((existing) => Math.abs(existing - position) <= epsilon * 2)) cutPositions.push(position);
+    }
+    traversed += distance(targetSegment.a, targetSegment.b);
+  });
+  cutPositions.sort((a, b) => a - b);
+
+  const untouched = paths.filter((_, index) => index !== hit.pathIndex);
+  const clickPosition = Math.max(0, Math.min(total, hit.position));
+  if (closed) {
+    const cuts = cutPositions.filter((position) => position >= 0 && position < total - epsilon);
+    if (cuts.length < 2) return null;
+    let nextIndex = cuts.findIndex((position) => position > clickPosition + epsilon);
+    if (nextIndex < 0) nextIndex = 0;
+    const previousIndex = (nextIndex - 1 + cuts.length) % cuts.length;
+    const previous = cuts[previousIndex];
+    const next = cuts[nextIndex];
+    let kept: Point[];
+    if (previous < next) {
+      const tail = slicePath(path, next, total, epsilon);
+      const head = slicePath(path, 0, previous, epsilon);
+      kept = [...tail, ...head.slice(tail.length && head.length && distance(tail[tail.length - 1], head[0]) <= epsilon * 2 ? 1 : 0)];
+    } else {
+      kept = slicePath(path, next, previous, epsilon);
+    }
+    const resultPaths = [...untouched, kept].filter((candidate) => candidate.length > 1 && pathLength(candidate) > epsilon);
+    return { paths: resultPaths, cutCount: cuts.length, closed: true };
+  }
+
+  const cuts = cutPositions.filter((position) => position > epsilon && position < total - epsilon);
+  if (!cuts.length) return null;
+  const boundaries = [0, ...cuts, total];
+  let lower = 0;
+  let upper = total;
+  for (let index = 0; index < boundaries.length - 1; index += 1) {
+    if (clickPosition >= boundaries[index] - epsilon && clickPosition <= boundaries[index + 1] + epsilon) {
+      lower = boundaries[index];
+      upper = boundaries[index + 1];
+      break;
+    }
+  }
+  const kept = [
+    slicePath(path, 0, lower, epsilon),
+    slicePath(path, upper, total, epsilon),
+  ].filter((candidate) => candidate.length > 1 && pathLength(candidate) > epsilon);
+  return { paths: [...untouched, ...kept], cutCount: cuts.length, closed: false };
+}
+
 function niceStep(raw: number) {
   const power = Math.pow(10, Math.floor(Math.log10(raw)));
   const fraction = raw / power;
@@ -688,6 +840,7 @@ export default function AnalyticCad() {
   const [draftCurrent, setDraftCurrent] = useState<Point | null>(null);
   const [measure, setMeasure] = useState<{ a: Point; b: Point } | null>(null);
   const [selectedCurveId, setSelectedCurveId] = useState<string>(DEFAULT_CURVES[0].id);
+  const [selectedEntityId, setSelectedEntityId] = useState<string | null>(null);
   const [selectedIntersectionId, setSelectedIntersectionId] = useState<string | null>(null);
   const [inspection, setInspection] = useState<Inspection | null>(null);
   const [mobilePanel, setMobilePanel] = useState<"formulas" | "draw" | "results" | "gcode" | null>(null);
@@ -719,6 +872,7 @@ export default function AnalyticCad() {
     [curves, paramScope, bounds],
   );
   const selectedCurve = curves.find((curve) => curve.id === selectedCurveId) ?? null;
+  const selectedDrawEntity = drawEntities.find((entity) => entity.id === selectedEntityId) ?? null;
   const selectedGeometry = plotGeometries.find((geometry) => geometry.curve.id === selectedCurveId) ?? null;
   const gcode = useMemo(() => generateGCode(pathPoints, post), [pathPoints, post]);
   const gcodeChecks = useMemo(() => {
@@ -798,6 +952,9 @@ export default function AnalyticCad() {
     setPathPoints(snapshot.pathPoints);
     setIntersections([]);
     setSelectedIntersectionId(null);
+    setSelectedCurveId(snapshot.curves[0]?.id ?? "");
+    setSelectedEntityId(null);
+    setInspection(null);
   };
 
   const undo = () => {
@@ -821,10 +978,15 @@ export default function AnalyticCad() {
   const fitView = useCallback((extraPoints: Point[] = []) => {
     const points = [
       ...plotGeometries.flatMap((geometry) => geometry.points),
-      ...drawEntities.flatMap((entity) => entity.type === "point" ? [entity.p] : entity.type === "line" ? [entity.a, entity.b] : [
-        { x: entity.c.x - entity.r, y: entity.c.y - entity.r },
-        { x: entity.c.x + entity.r, y: entity.c.y + entity.r },
-      ]),
+      ...drawEntities.flatMap((entity) => {
+        if (entity.type === "point") return [entity.p];
+        if (entity.type === "line") return [entity.a, entity.b];
+        if (entity.type === "polyline") return entity.points;
+        return [
+          { x: entity.c.x - entity.r, y: entity.c.y - entity.r },
+          { x: entity.c.x + entity.r, y: entity.c.y + entity.r },
+        ];
+      }),
       ...extraPoints,
     ].filter(finitePoint);
     if (!points.length) {
@@ -854,6 +1016,12 @@ export default function AnalyticCad() {
       } else if (entity.type === "line") {
         if (snaps.Fine) candidates.push({ point: entity.a, kind: "Fine", priority: 2 }, { point: entity.b, kind: "Fine", priority: 2 });
         if (snaps.Medio) candidates.push({ point: { x: (entity.a.x + entity.b.x) / 2, y: (entity.a.y + entity.b.y) / 2 }, kind: "Medio", priority: 3 });
+      } else if (entity.type === "polyline") {
+        if (snaps.Fine && entity.points.length) {
+          candidates.push({ point: entity.points[0], kind: "Fine", priority: 2 });
+          candidates.push({ point: entity.points[entity.points.length - 1], kind: "Fine", priority: 2 });
+        }
+        if (snaps.Medio && entity.points.length > 2) candidates.push({ point: entity.points[Math.floor(entity.points.length / 2)], kind: "Medio", priority: 3 });
       } else {
         if (snaps.Centro) candidates.push({ point: entity.c, kind: "Centro", priority: 2 });
         if (snaps.Fine) {
@@ -899,6 +1067,12 @@ export default function AnalyticCad() {
           const point = nearestOnSegment(world, { a: entity.a, b: entity.b });
           const d = distance(world, point);
           if (d <= radius && (!best || d < best.score)) best = { point, kind: "Vicino", score: d };
+        } else if (entity.type === "polyline") {
+          for (const segment of pathSegments(entity.points)) {
+            const point = nearestOnSegment(world, segment);
+            const d = distance(world, point);
+            if (d <= radius && (!best || d < best.score)) best = { point, kind: "Vicino", score: d };
+          }
         } else if (entity.type === "circle") {
           const angle = Math.atan2(world.y - entity.c.y, world.x - entity.c.x);
           const point = { x: entity.c.x + entity.r * Math.cos(angle), y: entity.c.y + entity.r * Math.sin(angle) };
@@ -909,6 +1083,88 @@ export default function AnalyticCad() {
     }
     return best ? { point: best.point, kind: best.kind } : null;
   }, [view.scale, snaps, intersections, drawEntities, plotGeometries, tool, draftStart]);
+
+  const performSmartTrim = (world: Point) => {
+    const trimBounds = {
+      xMin: Math.min(calcDomain.xMin, bounds.xMin),
+      xMax: Math.max(calcDomain.xMax, bounds.xMax),
+      yMin: Math.min(calcDomain.yMin, bounds.yMin),
+      yMax: Math.max(calcDomain.yMax, bounds.yMax),
+    };
+    const geometries = curves.filter((curve) => curve.visible).map((curve) => sampledGeometry(curve, paramScope, trimBounds));
+    let curveTarget: { geometry: PlotGeometry; hit: PathLocation } | null = null;
+    for (const geometry of geometries) {
+      const paths = geometry.paths ?? [];
+      const hit = nearestPathLocation(paths, world);
+      if (hit && (!curveTarget || hit.distance < curveTarget.hit.distance)) curveTarget = { geometry, hit };
+    }
+
+    let entityTarget: { entity: DrawEntity; paths: Point[][]; hit: PathLocation } | null = null;
+    for (const entity of drawEntities) {
+      if (entity.type === "point") continue;
+      const paths = entityPaths(entity);
+      const hit = nearestPathLocation(paths, world);
+      if (hit && (!entityTarget || hit.distance < entityTarget.hit.distance)) entityTarget = { entity, paths, hit };
+    }
+
+    const threshold = 15 / view.scale;
+    const curveDistance = curveTarget?.hit.distance ?? Infinity;
+    const entityDistance = entityTarget?.hit.distance ?? Infinity;
+    if (Math.min(curveDistance, entityDistance) > threshold) {
+      setStatus("Taglia intelligente: tocca una curva o una linea");
+      return;
+    }
+
+    const epsilon = Math.max(1e-6, tolerance * 2, 0.25 / view.scale);
+    if (entityTarget && entityDistance < curveDistance) {
+      const cutters = [
+        ...geometries.flatMap((geometry) => geometry.segments),
+        ...drawEntities.filter((entity) => entity.id !== entityTarget!.entity.id).flatMap(entitySegments),
+      ];
+      const trimmed = trimPathAtLocation(entityTarget.paths, entityTarget.hit, cutters, epsilon);
+      if (!trimmed) {
+        setStatus(entityTarget.entity.type === "circle"
+          ? "Taglia intelligente: servono almeno due intersezioni sulla circonferenza"
+          : "Taglia intelligente: nessun bordo di taglio trovato");
+        return;
+      }
+      pushHistory();
+      const replacements: DrawEntity[] = trimmed.paths.map((path, index) => ({
+        id: uid("trim"),
+        type: "polyline",
+        points: path,
+        source: (entityTarget!.entity.type === "circle" ? "Arco " : "Profilo ") + (index + 1),
+      }));
+      setDrawEntities((current) => current.flatMap((entity) => entity.id === entityTarget!.entity.id ? replacements : [entity]));
+      setSelectedEntityId(replacements[0]?.id ?? null);
+      setSelectedCurveId("");
+      setInspection(null);
+      setIntersections([]);
+      setStatus("Taglio completato · " + replacements.length + " tratti conservati");
+      return;
+    }
+
+    if (!curveTarget) return;
+    const cutters = [
+      ...geometries.filter((geometry) => geometry.curve.id !== curveTarget!.geometry.curve.id).flatMap((geometry) => geometry.segments),
+      ...drawEntities.flatMap(entitySegments),
+    ];
+    const trimmed = trimPathAtLocation(curveTarget.geometry.paths ?? [], curveTarget.hit, cutters, epsilon);
+    if (!trimmed) {
+      const message = curveTarget.geometry.paths?.some((path) => distance(path[0], path[path.length - 1]) <= epsilon * 2)
+        ? "Taglia intelligente: servono almeno due intersezioni sul profilo chiuso"
+        : "Taglia intelligente: nessun bordo di taglio trovato";
+      setStatus(message);
+      return;
+    }
+    pushHistory();
+    setCurves((current) => current.map((curve) => curve.id === curveTarget!.geometry.curve.id ? { ...curve, trimmedPaths: trimmed.paths } : curve));
+    setSelectedCurveId(curveTarget.geometry.curve.id);
+    setSelectedEntityId(null);
+    setInspection(null);
+    setIntersections([]);
+    setStatus("Taglio intelligente completato su " + curveTarget.geometry.curve.name + " · Annulla per ripristinare");
+  };
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -959,7 +1215,7 @@ export default function AnalyticCad() {
       const origin = worldToScreen({ x: 0, y: 0 });
       ctx.beginPath(); ctx.moveTo(0, origin.y); ctx.lineTo(w, origin.y); ctx.moveTo(origin.x, 0); ctx.lineTo(origin.x, h);
       ctx.strokeStyle = "rgba(203, 216, 228, .58)"; ctx.lineWidth = 1.3; ctx.stroke();
-      ctx.fillStyle = "rgba(201, 214, 226, .7)"; ctx.font = "11px ui-monospace, SFMono-Regular, Menlo, monospace";
+      ctx.fillStyle = "rgba(201, 214, 226, .7)"; ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, monospace";
       const xStart = Math.floor(bounds.xMin / step) * step;
       for (let x = xStart; x <= bounds.xMax; x += step) {
         if (Math.abs(x) < step / 10) continue;
@@ -972,7 +1228,7 @@ export default function AnalyticCad() {
         const sy = worldToScreen({ x: 0, y }).y;
         ctx.fillText(fmt(y, 3), Math.min(w - 35, Math.max(5, origin.x + 5)), sy - 4);
       }
-      ctx.fillStyle = "#ff922d"; ctx.font = "bold 12px Inter, sans-serif";
+      ctx.fillStyle = "#ff922d"; ctx.font = "bold 13px Inter, sans-serif";
       ctx.fillText("X", w - 18, Math.min(h - 8, Math.max(16, origin.y - 8)));
       ctx.fillText("Y", Math.min(w - 18, Math.max(8, origin.x + 8)), 16);
     }
@@ -991,19 +1247,33 @@ export default function AnalyticCad() {
       ctx.stroke();
       ctx.restore();
     }
-    ctx.save();
-    ctx.strokeStyle = "#e9edf2"; ctx.fillStyle = "#e9edf2"; ctx.lineWidth = 1.6;
     for (const entity of drawEntities) {
+      const selected = entity.id === selectedEntityId;
+      ctx.save();
+      ctx.strokeStyle = selected ? "#ffad4d" : "#e9edf2";
+      ctx.fillStyle = selected ? "#ffad4d" : "#e9edf2";
+      ctx.lineWidth = selected ? 2.8 : 1.6;
+      if (selected) {
+        ctx.shadowColor = "#ff8617";
+        ctx.shadowBlur = 9;
+      }
       if (entity.type === "point") {
-        const p = worldToScreen(entity.p); ctx.beginPath(); ctx.arc(p.x, p.y, 3.5, 0, Math.PI * 2); ctx.fill();
+        const p = worldToScreen(entity.p); ctx.beginPath(); ctx.arc(p.x, p.y, selected ? 5 : 3.5, 0, Math.PI * 2); ctx.fill();
       } else if (entity.type === "line") {
         const a = worldToScreen(entity.a); const b = worldToScreen(entity.b); ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+      } else if (entity.type === "polyline") {
+        ctx.beginPath();
+        entity.points.forEach((point, index) => {
+          const screen = worldToScreen(point);
+          if (index === 0) ctx.moveTo(screen.x, screen.y); else ctx.lineTo(screen.x, screen.y);
+        });
+        ctx.stroke();
       } else {
         const c = worldToScreen(entity.c); ctx.beginPath(); ctx.arc(c.x, c.y, entity.r * view.scale, 0, Math.PI * 2); ctx.stroke();
         ctx.beginPath(); ctx.moveTo(c.x - 5, c.y); ctx.lineTo(c.x + 5, c.y); ctx.moveTo(c.x, c.y - 5); ctx.lineTo(c.x, c.y + 5); ctx.stroke();
       }
+      ctx.restore();
     }
-    ctx.restore();
     if (pathPoints.length) {
       ctx.save();
       ctx.beginPath();
@@ -1040,7 +1310,7 @@ export default function AnalyticCad() {
       ctx.beginPath(); ctx.moveTo(p.x - dx, p.y - dy); ctx.lineTo(p.x + dx, p.y + dy); ctx.stroke();
       ctx.setLineDash([]);
       ctx.beginPath(); ctx.arc(p.x, p.y, 5, 0, Math.PI * 2); ctx.fillStyle = "#091018"; ctx.fill(); ctx.strokeStyle = "#78dcff"; ctx.lineWidth = 2; ctx.stroke();
-      ctx.font = "bold 10px Inter, sans-serif";
+      ctx.font = "bold 11px Inter, sans-serif";
       ctx.fillStyle = "#8de2ff";
       ctx.fillText(`TAN ${fmt(inspection.angle * 180 / Math.PI, 2)}°`, p.x + 10, p.y - 10);
       ctx.restore();
@@ -1057,7 +1327,7 @@ export default function AnalyticCad() {
       ctx.save(); ctx.setLineDash([4, 4]); ctx.strokeStyle = "#64d3ff"; ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
       const label = `L ${fmt(distance(measure.a, measure.b), 4)}  ΔX ${fmt(measure.b.x - measure.a.x, 4)}  ΔY ${fmt(measure.b.y - measure.a.y, 4)}`;
       const mx = (a.x + b.x) / 2; const my = (a.y + b.y) / 2;
-      ctx.font = "12px ui-monospace, monospace"; const width = ctx.measureText(label).width + 12;
+      ctx.font = "13px ui-monospace, monospace"; const width = ctx.measureText(label).width + 12;
       ctx.fillStyle = "rgba(6,12,19,.9)"; ctx.fillRect(mx - width / 2, my - 27, width, 21);
       ctx.fillStyle = "#8cddff"; ctx.fillText(label, mx - width / 2 + 6, my - 12); ctx.restore();
     }
@@ -1070,9 +1340,9 @@ export default function AnalyticCad() {
       } else {
         ctx.strokeRect(p.x - 6, p.y - 6, 12, 12);
       }
-      ctx.font = "bold 11px Inter, sans-serif"; ctx.fillText(snapHit.kind.toUpperCase(), p.x + 10, p.y - 10); ctx.restore();
+      ctx.font = "bold 12px Inter, sans-serif"; ctx.fillText(snapHit.kind.toUpperCase(), p.x + 10, p.y - 10); ctx.restore();
     }
-  }, [canvasSize, view, bounds, gridVisible, axesVisible, plotGeometries, selectedCurveId, drawEntities, pathPoints, post.closePath, intersections, selectedIntersectionId, inspection, draftStart, draftCurrent, tool, measure, snapHit, worldToScreen]);
+  }, [canvasSize, view, bounds, gridVisible, axesVisible, plotGeometries, selectedCurveId, selectedEntityId, drawEntities, pathPoints, post.closePath, intersections, selectedIntersectionId, inspection, draftStart, draftCurrent, tool, measure, snapHit, worldToScreen]);
 
   const canvasPoint = (event: ReactPointerEvent<HTMLCanvasElement>): Point => {
     const rect = event.currentTarget.getBoundingClientRect();
@@ -1098,6 +1368,10 @@ export default function AnalyticCad() {
     if (tool === "zoom-window") {
       setDraftStart(rawWorld); setDraftCurrent(rawWorld); return;
     }
+    if (tool === "trim") {
+      performSmartTrim(rawWorld);
+      return;
+    }
     if (tool === "select") {
       const ix = intersections.find((item) => distance(item, world) < 12 / view.scale);
       if (ix) {
@@ -1111,22 +1385,47 @@ export default function AnalyticCad() {
           if (d < 10 / view.scale && (!nearest || d < nearest.d)) nearest = { id: geometry.curve.id, d, point, segment };
         }
       }
-      if (nearest) {
+      let nearestEntity: { entity: DrawEntity; d: number; point: Point; segment?: Segment } | null = null;
+      for (const entity of drawEntities) {
+        if (entity.type === "point") {
+          const d = distance(world, entity.p);
+          if (d < 12 / view.scale && (!nearestEntity || d < nearestEntity.d)) nearestEntity = { entity, d, point: entity.p };
+          continue;
+        }
+        for (const segment of entitySegments(entity)) {
+          const point = nearestOnSegment(world, segment);
+          const d = distance(world, point);
+          if (d < 10 / view.scale && (!nearestEntity || d < nearestEntity.d)) nearestEntity = { entity, d, point, segment };
+        }
+      }
+      if (nearestEntity && (!nearest || nearestEntity.d <= nearest.d)) {
+        setSelectedEntityId(nearestEntity.entity.id);
+        setSelectedCurveId("");
+        setSelectedIntersectionId(null);
+        setInspection(null);
+        const type = nearestEntity.entity.type === "line" ? "Retta" : nearestEntity.entity.type === "circle" ? "Circonferenza" : nearestEntity.entity.type === "polyline" ? "Profilo tagliato" : "Punto";
+        setStatus(type + " selezionata · usa il cestino o il tasto Canc");
+      } else if (nearest) {
         const dx = nearest.segment.b.x - nearest.segment.a.x;
         const dy = nearest.segment.b.y - nearest.segment.a.y;
         const angle = Math.atan2(dy, dx);
         const slope = Math.abs(dx) < 1e-12 ? (dy >= 0 ? Infinity : -Infinity) : dy / dx;
         setSelectedCurveId(nearest.id);
+        setSelectedEntityId(null);
         setInspection({ curveId: nearest.id, point: nearest.point, angle, slope });
         setStatus(`Punto interrogato X${fmt(nearest.point.x, 5)} Y${fmt(nearest.point.y, 5)} · tangente ${fmt(angle * 180 / Math.PI, 3)}°`);
       } else {
+        setSelectedCurveId("");
+        setSelectedEntityId(null);
+        setSelectedIntersectionId(null);
         setInspection(null);
         setStatus(`Punto X${fmt(world.x)} Y${fmt(world.y)}`);
       }
       return;
     }
     if (tool === "point") {
-      pushHistory(); setDrawEntities((current) => [...current, { id: uid("point"), type: "point", p: world }]); setStatus("Punto creato"); return;
+      const id = uid("point");
+      pushHistory(); setDrawEntities((current) => [...current, { id, type: "point", p: world }]); setSelectedEntityId(id); setSelectedCurveId(""); setStatus("Punto creato e selezionato"); return;
     }
     if (tool === "line" || tool === "circle" || tool === "measure") {
       if (!draftStart) {
@@ -1134,12 +1433,14 @@ export default function AnalyticCad() {
       } else {
         if (tool === "line") {
           if (distance(draftStart, world) > 1e-9) {
-            pushHistory(); setDrawEntities((current) => [...current, { id: uid("line"), type: "line", a: draftStart, b: world }]); setStatus(`Linea L=${fmt(distance(draftStart, world), 4)}`);
+            const id = uid("line");
+            pushHistory(); setDrawEntities((current) => [...current, { id, type: "line", a: draftStart, b: world }]); setSelectedEntityId(id); setSelectedCurveId(""); setStatus(`Linea selezionata · L=${fmt(distance(draftStart, world), 4)}`);
           }
         } else if (tool === "circle") {
           const r = distance(draftStart, world);
           if (r > 1e-9) {
-            pushHistory(); setDrawEntities((current) => [...current, { id: uid("circle"), type: "circle", c: draftStart, r }]); setStatus(`Circonferenza R=${fmt(r, 4)}`);
+            const id = uid("circle");
+            pushHistory(); setDrawEntities((current) => [...current, { id, type: "circle", c: draftStart, r }]); setSelectedEntityId(id); setSelectedCurveId(""); setStatus(`Circonferenza selezionata · R=${fmt(r, 4)}`);
           }
         } else {
           setMeasure({ a: draftStart, b: world }); setStatus(`Distanza ${fmt(distance(draftStart, world), 4)} mm`);
@@ -1211,11 +1512,16 @@ export default function AnalyticCad() {
       domainMax: preset?.type === "parametric" ? Math.PI * 8 : calcDomain.xMax,
       samples: preset?.type === "implicit" ? 120 : 900,
     };
-    setCurves((current) => [...current, curve]); setSelectedCurveId(curve.id); setShowPresets(false); setStatus(`${curve.name} aggiunta`);
+    setCurves((current) => [...current, curve]); setSelectedCurveId(curve.id); setSelectedEntityId(null); setShowPresets(false); setStatus(`${curve.name} aggiunta`);
   };
 
   const updateCurve = (id: string, patch: Partial<Curve>) => {
-    setCurves((current) => current.map((curve) => curve.id === id ? { ...curve, ...patch } : curve));
+    const resetsTrim = "expression" in patch || "type" in patch || "domainMin" in patch || "domainMax" in patch;
+    setCurves((current) => current.map((curve) => curve.id === id ? {
+      ...curve,
+      ...patch,
+      ...(resetsTrim ? { trimmedPaths: undefined } : {}),
+    } : curve));
     setIntersections([]);
     setSelectedIntersectionId(null);
     setInspection(null);
@@ -1241,11 +1547,69 @@ export default function AnalyticCad() {
   };
 
   const deleteCurve = (id: string) => {
-    pushHistory(); setCurves((current) => current.filter((curve) => curve.id !== id));
+    const remaining = curves.filter((curve) => curve.id !== id);
+    pushHistory();
+    setCurves(remaining);
     setIntersections((current) => current.filter((item) => !item.curves.includes(id)));
     setInspection((current) => current?.curveId === id ? null : current);
-    if (selectedCurveId === id) setSelectedCurveId(curves.find((curve) => curve.id !== id)?.id ?? "");
+    if (selectedCurveId === id) setSelectedCurveId(remaining[0]?.id ?? "");
+    setStatus("Curva eliminata · usa Annulla per ripristinare");
   };
+
+  const deleteDrawEntity = (id: string) => {
+    pushHistory();
+    setDrawEntities((current) => current.filter((entity) => entity.id !== id));
+    setSelectedEntityId((current) => current === id ? null : current);
+    setStatus("Entità disegnata eliminata · usa Annulla per ripristinare");
+  };
+
+  const restoreTrimmedCurve = (id: string) => {
+    const curve = curves.find((item) => item.id === id);
+    if (!curve?.trimmedPaths) return;
+    pushHistory();
+    setCurves((current) => current.map((item) => item.id === id ? { ...item, trimmedPaths: undefined } : item));
+    setIntersections([]);
+    setStatus(curve.name + " ripristinata dalla formula originale");
+  };
+
+  const deleteSelection = () => {
+    if (selectedEntityId) {
+      deleteDrawEntity(selectedEntityId);
+      return;
+    }
+    if (selectedCurveId && curves.some((curve) => curve.id === selectedCurveId)) deleteCurve(selectedCurveId);
+    else setStatus("Seleziona prima una curva, una retta o un punto");
+  };
+
+  const clearDrawings = () => {
+    if (!drawEntities.length && !measure) {
+      setStatus("Non ci sono disegni da cancellare");
+      return;
+    }
+    pushHistory();
+    setDrawEntities([]);
+    setMeasure(null);
+    setSelectedEntityId(null);
+    setStatus("Tutti i disegni sono stati cancellati · usa Annulla per ripristinare");
+  };
+
+  useEffect(() => {
+    const handleDeleteKey = (event: KeyboardEvent) => {
+      const target = event.target;
+      if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement || (target instanceof HTMLElement && target.isContentEditable)) return;
+      if (event.key === "Delete" || event.key === "Backspace") {
+        event.preventDefault();
+        deleteSelection();
+      } else if (event.key === "Escape") {
+        setDraftStart(null);
+        setDraftCurrent(null);
+        setTool("select");
+        setStatus("Comando annullato");
+      }
+    };
+    window.addEventListener("keydown", handleDeleteKey);
+    return () => window.removeEventListener("keydown", handleDeleteKey);
+  });
 
   const runIntersections = () => {
     setStatus("Calcolo intersezioni…");
@@ -1286,6 +1650,21 @@ export default function AnalyticCad() {
     setMobilePanel("gcode");
   };
 
+  const addDrawEntityToPath = () => {
+    if (!selectedDrawEntity || selectedDrawEntity.type === "point") return;
+    const paths = entityPaths(selectedDrawEntity, 360);
+    const sourcePath = paths.reduce((longest, path) => pathLength(path) > pathLength(longest) ? path : longest, [] as Point[]);
+    if (sourcePath.length < 2) return;
+    pushHistory();
+    const target = 500;
+    const stride = Math.max(1, Math.floor(sourcePath.length / target));
+    const points = sourcePath.filter((_, index) => index % stride === 0);
+    if (distance(points[points.length - 1], sourcePath[sourcePath.length - 1]) > 1e-10) points.push(sourcePath[sourcePath.length - 1]);
+    setPathPoints(points);
+    setStatus(points.length + " punti convertiti dall'entità disegnata");
+    setMobilePanel("gcode");
+  };
+
   const saveProject = async () => {
     const project = {
       app: "GT.Code Analytic CAD", version: VERSION, savedAt: new Date().toISOString(),
@@ -1315,7 +1694,7 @@ export default function AnalyticCad() {
       pushHistory(); setCurves(project.curves); setParams(project.params ?? DEFAULT_PARAMS); setIntersections(project.intersections ?? []);
       setDrawEntities(project.drawEntities ?? []); setPathPoints(project.pathPoints ?? []); setView(project.view ?? DEFAULT_VIEW);
       setPost({ ...DEFAULT_POST, ...(project.post ?? {}) }); setTolerance(project.tolerance ?? 0.01); setCalcDomain(project.calcDomain ?? calcDomain);
-      setSelectedCurveId(project.curves[0]?.id ?? ""); setStatus(`${file.name} aperto`);
+      setSelectedCurveId(project.curves[0]?.id ?? ""); setSelectedEntityId(null); setStatus(`${file.name} aperto`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Impossibile aprire il file");
     }
@@ -1341,6 +1720,7 @@ export default function AnalyticCad() {
   };
 
   const curveName = (id: string) => curves.find((curve) => curve.id === id)?.name ?? "Curva";
+  const drawEntityName = (entity: DrawEntity) => entity.type === "line" ? "Retta disegnata" : entity.type === "circle" ? "Circonferenza disegnata" : entity.type === "polyline" ? (entity.source ?? "Profilo tagliato") : "Punto disegnato";
   const selectedCurveError = selectedCurve ? sampledGeometry(selectedCurve, paramScope, calcDomain).error : undefined;
 
   return (
@@ -1380,7 +1760,7 @@ export default function AnalyticCad() {
               const geometry = plotGeometries.find((item) => item.curve.id === curve.id);
               const error = curve.visible ? geometry?.error : undefined;
               const isSelected = selectedCurveId === curve.id;
-              return <article key={curve.id} className={`curve-card ${isSelected ? "selected" : ""}`} onClick={() => setSelectedCurveId(curve.id)}>
+              return <article key={curve.id} className={`curve-card ${isSelected ? "selected" : ""}`} onClick={() => { setSelectedCurveId(curve.id); setSelectedEntityId(null); }}>
                 <div className="curve-card-top">
                   <button type="button" className={`visibility-dot ${curve.visible ? "visible" : ""}`} style={{ "--curve-color": curve.color } as React.CSSProperties} aria-label={curve.visible ? "Nascondi curva" : "Mostra curva"} onClick={(event) => { event.stopPropagation(); updateCurve(curve.id, { visible: !curve.visible }); }} />
                   <input className="curve-name" aria-label={`Nome curva ${index + 1}`} value={curve.name} onChange={(event) => updateCurve(curve.id, { name: event.target.value })} />
@@ -1398,6 +1778,7 @@ export default function AnalyticCad() {
                   <NumberField label={curve.type === "parametric" ? "t min" : "X min"} value={curve.domainMin} onChange={(value) => updateCurve(curve.id, { domainMin: value })} />
                   <NumberField label={curve.type === "parametric" ? "t max" : "X max"} value={curve.domainMax} onChange={(value) => updateCurve(curve.id, { domainMax: value })} />
                 </div>}
+                {curve.trimmedPaths && <div className="trimmed-state"><span><Scissors size={13} /> Profilo tagliato</span><button type="button" onClick={(event) => { event.stopPropagation(); restoreTrimmedCurve(curve.id); }}><RotateCcw size={12} /> Ripristina</button></div>}
                 {error && isSelected && <p className="inline-error">{error}</p>}
               </article>;
             })}
@@ -1429,7 +1810,7 @@ export default function AnalyticCad() {
             <button type="button" className="primary-button full" onClick={runIntersections}><Sparkles size={16} /> Calcola intersezioni</button>
           </div>
         </> : <div className="draw-mobile-content">
-          <DrawingControls tool={tool} setTool={setTool} snaps={snaps} setSnaps={setSnaps} gridVisible={gridVisible} setGridVisible={setGridVisible} axesVisible={axesVisible} setAxesVisible={setAxesVisible} fitView={() => fitView()} clearDrawings={() => { pushHistory(); setDrawEntities([]); setMeasure(null); }} />
+          <DrawingControls tool={tool} setTool={setTool} snaps={snaps} setSnaps={setSnaps} gridVisible={gridVisible} setGridVisible={setGridVisible} axesVisible={axesVisible} setAxesVisible={setAxesVisible} fitView={() => fitView()} clearDrawings={clearDrawings} deleteSelection={deleteSelection} canDeleteSelection={Boolean(selectedCurve || selectedDrawEntity)} />
         </div>}
       </section>
 
@@ -1437,7 +1818,7 @@ export default function AnalyticCad() {
 
       <section className="canvas-stage" ref={canvasWrapRef}>
         <div className="canvas-toolbar desktop-drawing-toolbar">
-          <DrawingControls compact tool={tool} setTool={setTool} snaps={snaps} setSnaps={setSnaps} gridVisible={gridVisible} setGridVisible={setGridVisible} axesVisible={axesVisible} setAxesVisible={setAxesVisible} fitView={() => fitView()} clearDrawings={() => { pushHistory(); setDrawEntities([]); setMeasure(null); }} />
+          <DrawingControls compact tool={tool} setTool={setTool} snaps={snaps} setSnaps={setSnaps} gridVisible={gridVisible} setGridVisible={setGridVisible} axesVisible={axesVisible} setAxesVisible={setAxesVisible} fitView={() => fitView()} clearDrawings={clearDrawings} deleteSelection={deleteSelection} canDeleteSelection={Boolean(selectedCurve || selectedDrawEntity)} />
         </div>
         <canvas
           ref={canvasRef}
@@ -1454,9 +1835,11 @@ export default function AnalyticCad() {
         />
         <div className="view-badge"><span>{fmt(1 / view.scale * 100, 3)} u / 100 px</span><b>XY</b></div>
         <div className="orientation-widget"><span className="y-axis">Y</span><span className="x-axis">X</span><i /></div>
-        {selectedCurve && <div className="selection-float">
-          <span style={{ background: selectedCurve.color }} /><div><small>SELEZIONE</small><b>{selectedCurve.name}</b></div>
-          <button type="button" onClick={addCurveToPath}>Crea percorso</button>
+        {(selectedCurve || selectedDrawEntity) && <div className="selection-float">
+          <span style={{ background: selectedCurve?.color ?? "#ffad4d" }} /><div><small>SELEZIONE</small><b>{selectedCurve ? selectedCurve.name : selectedDrawEntity ? drawEntityName(selectedDrawEntity) : ""}</b></div>
+          {selectedCurve && <button type="button" onClick={addCurveToPath}>Crea percorso</button>}
+          {selectedDrawEntity && selectedDrawEntity.type !== "point" && <button type="button" onClick={addDrawEntityToPath}>Crea percorso</button>}
+          <IconButton className="selection-delete" label="Elimina selezione" onClick={deleteSelection}><Trash2 size={16} /></IconButton>
         </div>}
       </section>
 
@@ -1484,8 +1867,11 @@ export default function AnalyticCad() {
             <div className="section-title"><Info size={15} /> Proprietà selezione</div>
             {selectedCurve ? <>
               <dl><div><dt>Entità</dt><dd>{selectedCurve.name}</dd></div><div><dt>Tipo</dt><dd>{selectedCurve.type === "function" ? "Funzione esplicita" : selectedCurve.type === "implicit" ? "Equazione implicita" : "Curva parametrica"}</dd></div><div><dt>Campioni</dt><dd>{selectedGeometry?.points.length ?? 0}</dd></div><div><dt>Stato</dt><dd className={selectedCurveError ? "bad" : "good"}>{selectedCurveError ? "Errore" : "Valida"}</dd></div>{inspection?.curveId === selectedCurve.id && <><div><dt>Punto X / Y</dt><dd>{fmt(inspection.point.x, 4)} / {fmt(inspection.point.y, 4)}</dd></div><div><dt>Tangente</dt><dd>{fmt(inspection.angle * 180 / Math.PI, 3)}°</dd></div><div><dt>Pendenza</dt><dd>{Number.isFinite(inspection.slope) ? fmt(inspection.slope, 5) : "Verticale"}</dd></div></>}</dl>
-              <button type="button" className="secondary-button full" disabled={!selectedGeometry?.points.length} onClick={addCurveToPath}><FileCode2 size={15} /> Converti curva in punti</button>
-            </> : <p className="muted-copy">Seleziona una curva nell’area grafica.</p>}
+              <div className="inspector-actions"><button type="button" className="secondary-button" disabled={!selectedGeometry?.points.length} onClick={addCurveToPath}><FileCode2 size={15} /> Converti</button><button type="button" className="danger-button" onClick={deleteSelection}><Trash2 size={15} /> Elimina</button></div>
+            </> : selectedDrawEntity ? <>
+              <dl><div><dt>Entità</dt><dd>{drawEntityName(selectedDrawEntity)}</dd></div><div><dt>Tipo</dt><dd>{selectedDrawEntity.type}</dd></div><div><dt>Stato</dt><dd className="good">Selezionata</dd></div></dl>
+              <div className="inspector-actions">{selectedDrawEntity.type !== "point" && <button type="button" className="secondary-button" onClick={addDrawEntityToPath}><FileCode2 size={15} /> Converti</button>}<button type="button" className="danger-button" onClick={deleteSelection}><Trash2 size={15} /> Elimina</button></div>
+            </> : <p className="muted-copy">Seleziona una curva, una retta, un cerchio o un punto nell’area grafica.</p>}
           </div>
         </> : <GCodePanel pathPoints={pathPoints} setPathPoints={setPathPoints} post={post} setPost={setPost} gcode={gcode} checks={gcodeChecks} onExport={exportGCode} onCopy={copyGCode} onOpen={() => setShowGCode(true)} />}
       </section>
@@ -1523,7 +1909,7 @@ export default function AnalyticCad() {
           <section><span className="help-number">01</span><div><h3>Scrivi la geometria</h3><p>Esplicita: <code>y = 2*x + 5</code><br />Implicita: <code>x^2 + y^2 = 900</code><br />Parametrica: <code>x=20*cos(t); y=20*sin(t)</code></p></div></section>
           <section><span className="help-number">02</span><div><h3>Definisci il dominio</h3><p>Le soluzioni numeriche dipendono dall’intervallo X/Y e dalla tolleranza. Restringi il dominio per separare soluzioni molto vicine.</p></div></section>
           <section><span className="help-number">03</span><div><h3>Interroga e disegna</h3><p>Rotella o pinch per lo zoom. Usa SNAP Fine, Medio, Centro, Intersezione, Vicino e Tangente. Il doppio tocco adatta la vista.</p></div></section>
-          <section><span className="help-number">04</span><div><h3>Crea il percorso</h3><p>Seleziona una curva o aggiungi singoli punti. Controlla ordine e verso, poi genera il programma Fanuc.</p></div></section>
+          <section><span className="help-number">04</span><div><h3>Taglia e crea il percorso</h3><p>Attiva le forbici, poi tocca la porzione tra due intersezioni da eliminare. Seleziona il profilo rimasto, controlla ordine e verso, quindi genera il programma Fanuc.</p></div></section>
         </div>
         <div className="safety-note"><Info size={18} /><p><strong>Nota CNC:</strong> il programma è un risultato geometrico, non una validazione tecnologica. Verificare origine, Z, utensile, compensazione, staffaggio e collisioni sul controllo/simulatore prima dell’esecuzione.</p></div>
       </Modal>}
@@ -1571,13 +1957,14 @@ export default function AnalyticCad() {
   );
 }
 
-function DrawingControls({ tool, setTool, snaps, setSnaps, gridVisible, setGridVisible, axesVisible, setAxesVisible, fitView, clearDrawings, compact = false }: {
+function DrawingControls({ tool, setTool, snaps, setSnaps, gridVisible, setGridVisible, axesVisible, setAxesVisible, fitView, clearDrawings, deleteSelection, canDeleteSelection, compact = false }: {
   tool: Tool; setTool: (tool: Tool) => void; snaps: SnapState; setSnaps: React.Dispatch<React.SetStateAction<SnapState>>;
   gridVisible: boolean; setGridVisible: (value: boolean) => void; axesVisible: boolean; setAxesVisible: (value: boolean) => void;
-  fitView: () => void; clearDrawings: () => void; compact?: boolean;
+  fitView: () => void; clearDrawings: () => void; deleteSelection: () => void; canDeleteSelection: boolean; compact?: boolean;
 }) {
   const tools: Array<{ id: Tool; label: string; icon: React.ReactNode }> = [
     { id: "select", label: "Seleziona / interroga", icon: <MousePointer2 size={17} /> },
+    { id: "trim", label: "Taglia intelligente", icon: <Scissors size={17} /> },
     { id: "pan", label: "Panoramica", icon: <Move size={17} /> },
     { id: "point", label: "Punto", icon: <CircleDot size={17} /> },
     { id: "line", label: "Linea", icon: <PencilRuler size={17} /> },
@@ -1592,13 +1979,14 @@ function DrawingControls({ tool, setTool, snaps, setSnaps, gridVisible, setGridV
       <IconButton label="Adatta alla finestra" onClick={fitView}><Maximize size={17} /></IconButton>
       <IconButton label="Mostra griglia" active={gridVisible} onClick={() => setGridVisible(!gridVisible)}><Grid3X3 size={17} /></IconButton>
       <IconButton label="Mostra assi" active={axesVisible} onClick={() => setAxesVisible(!axesVisible)}><Crosshair size={17} /></IconButton>
-      {!compact && <IconButton label="Cancella disegni" onClick={clearDrawings}><Trash2 size={17} /></IconButton>}
+      <IconButton className="delete-tool" label="Elimina selezione" disabled={!canDeleteSelection} onClick={deleteSelection}><Trash2 size={17} /></IconButton>
+      {!compact && <IconButton label="Cancella tutti i disegni" onClick={clearDrawings}><X size={17} /></IconButton>}
     </div>
     <div className="snap-tools">
       <b>OSNAP</b>
-      {(Object.keys(snaps) as SnapKind[]).map((kind) => <button type="button" key={kind} className={snaps[kind] ? "active" : ""} onClick={() => setSnaps((current) => ({ ...current, [kind]: !current[kind] }))}>{kind}</button>)}
+      {(Object.keys(snaps) as SnapKind[]).map((kind) => <button type="button" key={kind} title={kind} className={snaps[kind] ? "active" : ""} onClick={() => setSnaps((current) => ({ ...current, [kind]: !current[kind] }))}>{compact ? kind.slice(0, 3).toUpperCase() : kind}</button>)}
     </div>
-    {!compact && <div className="draw-help"><Info size={15} /><p>Seleziona uno strumento e tocca l’area grafica. Lo snap <b>Tangente</b> è disponibile tracciando una linea verso una circonferenza disegnata.</p></div>}
+    {!compact && <div className="draw-help"><Info size={15} /><p>Seleziona uno strumento e tocca l’area grafica. Con <b>Taglia intelligente</b> tocca il tratto compreso tra le intersezioni da rimuovere. Il cestino elimina l’entità selezionata.</p></div>}
   </div>;
 }
 

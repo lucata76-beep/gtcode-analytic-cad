@@ -1,6 +1,15 @@
-# GT.Code Analytic CAD v1.0.0
+# GT.Code Analytic CAD v1.1.0
 
 Applicazione CAD matematica 2D eseguita interamente nel browser. Permette di inserire funzioni esplicite, equazioni implicite e curve parametriche, calcolare intersezioni numeriche, disegnare entità semplici con snap e trasformare punti o curve campionate in G-code Fanuc G0/G1.
+
+## Novità v1.1.0
+
+- barra degli strumenti di disegno verticale sul lato destro;
+- selezione evidenziata e cancellazione affidabile di curve, rette, cerchi, punti e profili;
+- cancellazione tramite cestino, pannello proprietà e tasti `Canc`/`Backspace`;
+- taglio intelligente della porzione scelta tra le intersezioni;
+- pannelli laterali su iPhone al posto delle finestre agganciate in basso;
+- caratteri e controlli più leggibili.
 
 - Repository: https://github.com/lucata76-beep/gtcode-analytic-cad
 - Applicazione: https://lucata76-beep.github.io/gtcode-analytic-cad/
