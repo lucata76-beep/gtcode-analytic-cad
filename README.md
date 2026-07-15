@@ -1,6 +1,11 @@
-# GT.Code Analytic CAD v1.4.0
+# GT.Code Analytic CAD v1.4.1
 
 Applicazione CAD matematica 2D eseguita interamente nel browser. Permette di inserire funzioni esplicite, equazioni implicite e curve parametriche, calcolare intersezioni numeriche, disegnare entità semplici con snap e trasformare punti o curve campionate in G-code Fanuc G0/G1.
+
+## Correzione v1.4.1
+
+- menu superiori renderizzati sopra il contenitore scorrevole, per garantire apertura e selezione affidabili su Safari/iPhone;
+- area del menu mobile estesa all’intera larghezza senza ritaglio del pannello a tendina.
 
 ## Novità v1.4.0
 

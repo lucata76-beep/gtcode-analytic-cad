@@ -8,6 +8,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { createPortal } from "react-dom";
 import { compile, parse } from "mathjs";
 import {
   Aperture,
@@ -120,7 +121,7 @@ type PostSettings = {
 };
 type PlotGeometry = { curve: Curve; segments: Segment[]; points: Point[]; paths?: Point[][]; error?: string };
 
-const VERSION = "1.4.0";
+const VERSION = "1.4.1";
 const COLORS = ["#ff8a1d", "#47c8ff", "#c985ff", "#73e0aa", "#f15b74", "#ffd166"];
 const DEFAULT_VIEW: View = { cx: 0, cy: 0, scale: 10 };
 const DEFAULT_PARAMS: Parameter[] = [
@@ -3167,11 +3168,16 @@ export default function AnalyticCad() {
 
 function TopMenuBar({ menus }: { menus: AppMenu[] }) {
   const [openMenu, setOpenMenu] = useState<string | null>(null);
+  const [menuPosition, setMenuPosition] = useState({ top: 0, left: 0 });
   const menuRef = useRef<HTMLElement>(null);
+  const dropdownRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const close = (event: PointerEvent) => {
-      if (menuRef.current && event.target instanceof Node && !menuRef.current.contains(event.target)) setOpenMenu(null);
+      if (!(event.target instanceof Node)) return;
+      const insideBar = menuRef.current?.contains(event.target);
+      const insideDropdown = dropdownRef.current?.contains(event.target);
+      if (!insideBar && !insideDropdown) setOpenMenu(null);
     };
     const closeWithEscape = (event: KeyboardEvent) => { if (event.key === "Escape") setOpenMenu(null); };
     document.addEventListener("pointerdown", close);
@@ -3179,11 +3185,21 @@ function TopMenuBar({ menus }: { menus: AppMenu[] }) {
     return () => { document.removeEventListener("pointerdown", close); window.removeEventListener("keydown", closeWithEscape); };
   }, []);
 
-  return <nav className="app-menubar" ref={menuRef} aria-label="Menu principale">
-    {menus.map((menu) => <div className={`app-menu ${openMenu === menu.label ? "open" : ""}`} key={menu.label}>
-      <button type="button" className="app-menu-trigger" aria-expanded={openMenu === menu.label} onClick={() => setOpenMenu((current) => current === menu.label ? null : menu.label)}>{menu.label}</button>
-      {openMenu === menu.label && <div className="app-menu-dropdown" role="menu">
-        {menu.entries.map((entry, index) => <button
+  const activeMenu = menus.find((menu) => menu.label === openMenu) ?? null;
+  const toggleMenu = (label: string, trigger: HTMLButtonElement) => {
+    if (openMenu === label) {
+      setOpenMenu(null);
+      return;
+    }
+    const rect = trigger.getBoundingClientRect();
+    const left = Math.max(6, Math.min(rect.left, window.innerWidth - 270));
+    setMenuPosition({ top: rect.bottom, left });
+    setOpenMenu(label);
+  };
+
+  const dropdown = activeMenu && typeof document !== "undefined" ? createPortal(
+    <div ref={dropdownRef} className="app-menu-dropdown app-menu-portal" role="menu" aria-label={`Menu ${activeMenu.label}`} style={{ top: menuPosition.top, left: menuPosition.left }}>
+      {activeMenu.entries.map((entry, index) => <button
           type="button"
           role="menuitem"
           key={`${entry.label}-${index}`}
@@ -3195,9 +3211,24 @@ function TopMenuBar({ menus }: { menus: AppMenu[] }) {
           <span>{entry.label}</span>
           {entry.shortcut && <kbd>{entry.shortcut}</kbd>}
         </button>)}
-      </div>}
-    </div>)}
-  </nav>;
+    </div>,
+    document.body,
+  ) : null;
+
+  return <>
+    <nav className="app-menubar" ref={menuRef} aria-label="Menu principale">
+      {menus.map((menu) => <div className={`app-menu ${openMenu === menu.label ? "open" : ""}`} key={menu.label}>
+        <button
+          type="button"
+          className="app-menu-trigger"
+          aria-haspopup="menu"
+          aria-expanded={openMenu === menu.label}
+          onClick={(event) => toggleMenu(menu.label, event.currentTarget)}
+        >{menu.label}</button>
+      </div>)}
+    </nav>
+    {dropdown}
+  </>;
 }
 
 function ConstructionShell({

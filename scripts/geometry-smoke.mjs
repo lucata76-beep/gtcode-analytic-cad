@@ -24,7 +24,7 @@ try {
   } = module;
 
   const markup = renderToStaticMarkup(React.createElement(AnalyticCad));
-  assert(markup.includes("GT.Code") && markup.includes("v1.4.0"), "L'interfaccia deve essere renderizzabile");
+  assert(markup.includes("GT.Code") && markup.includes("v1.4.1"), "L'interfaccia deve essere renderizzabile");
   assert(markup.includes(">Disegno<") && markup.includes(">Interroga<") && markup.includes(">Aiuto<") && markup.includes('aria-label="Guida"'), "Menu desktop, interrogazione e guida devono essere disponibili");
 
   const values = {
@@ -96,7 +96,7 @@ try {
   assert(circleEquation?.expression.includes("^2") && circleEquation.expression.includes("= 2^2"));
 
   const report = formatInquiryReport([{ id: "q1", name: "TG1", point: { x: 2, y: 0 }, kind: "tangency", source: "Cerchio ↔ Retta", details: "R=2" }], [], undefined, new Date("2026-07-15T12:00:00Z"));
-  assert(report.includes("V1.4.0") && report.includes("TG1 | TANGENZA | X=2 | Y=0") && report.includes("FINE REPORT"), "Il report TXT deve includere versione, nome e coordinate");
+  assert(report.includes("V1.4.1") && report.includes("TG1 | TANGENZA | X=2 | Y=0") && report.includes("FINE REPORT"), "Il report TXT deve includere versione, nome e coordinate");
 
   const commaLine = resolveConstructionGeometry("line", "two-points", "three-points", { ...values, p1x: "-2,5", p1y: "1,5", p2x: "1,5", p2y: "1,5" }, null, 1e-6);
   assert.equal(commaLine.geometry?.type, "line");
@@ -131,7 +131,7 @@ try {
   const noCut = trimPathAtLocation(openPath, openHit, [], 1e-6);
   assert.equal(noCut, null, "Senza intersezioni non deve avvenire alcun taglio");
 
-  console.log("Interfaccia v1.4 · costruzioni e interrogazioni: 17 scenari · taglio intelligente: 3 scenari superati");
+  console.log("Interfaccia v1.4.1 · menu mobile corretto · costruzioni e interrogazioni: 17 scenari · taglio intelligente: 3 scenari superati");
 } finally {
   await server.close();
 }
