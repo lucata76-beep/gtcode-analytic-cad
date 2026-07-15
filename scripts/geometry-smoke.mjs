@@ -11,10 +11,39 @@ const server = await createServer({
 
 try {
   const module = await server.ssrLoadModule("/src/analytic-cad.tsx");
-  const { default: AnalyticCad, nearestPathLocation, trimPathAtLocation } = module;
+  const { default: AnalyticCad, nearestPathLocation, trimPathAtLocation, resolveConstructionGeometry } = module;
 
   const markup = renderToStaticMarkup(React.createElement(AnalyticCad));
-  assert(markup.includes("GT.Code") && markup.includes("v1.1.0"), "L'interfaccia deve essere renderizzabile");
+  assert(markup.includes("GT.Code") && markup.includes("v1.2.0"), "L'interfaccia deve essere renderizzabile");
+  assert(markup.includes(">Disegno<") && markup.includes(">Aiuto<") && markup.includes('aria-label="Guida"'), "Menu desktop e accesso alla guida devono essere disponibili");
+
+  const values = {
+    p1x: "0", p1y: "0", p2x: "20", p2y: "0", p3x: "0", p3y: "10",
+    centerx: "0", centery: "0", angle: "90", length: "10",
+  };
+  const lineByPoints = resolveConstructionGeometry("line", "two-points", "three-points", values, null, 1e-6);
+  assert.equal(lineByPoints.geometry?.type, "line");
+  assert.equal(lineByPoints.geometry?.b.x, 20);
+
+  const lineByAngle = resolveConstructionGeometry("line", "point-angle", "three-points", values, null, 1e-6);
+  assert.equal(lineByAngle.geometry?.type, "line");
+  assert(Math.abs(lineByAngle.geometry.b.x) < 1e-10 && Math.abs(lineByAngle.geometry.b.y - 10) < 1e-10);
+
+  const threePointValues = { ...values, p1x: "10", p1y: "0", p2x: "0", p2y: "10", p3x: "-10", p3y: "0" };
+  const circleByPoints = resolveConstructionGeometry("circle", "two-points", "three-points", threePointValues, null, 1e-6);
+  assert.equal(circleByPoints.geometry?.type, "circle");
+  assert(Math.abs(circleByPoints.geometry.c.x) < 1e-10 && Math.abs(circleByPoints.geometry.r - 10) < 1e-10);
+
+  const circleByCenter = resolveConstructionGeometry("circle", "two-points", "center-two-points", { ...values, p1x: "5", p1y: "0", p2x: "0", p2y: "5" }, null, 1e-6);
+  assert.equal(circleByCenter.geometry?.type, "circle");
+  assert(Math.abs(circleByCenter.geometry.r - 5) < 1e-10);
+  const invalidCenteredCircle = resolveConstructionGeometry("circle", "two-points", "center-two-points", { ...values, p1x: "5", p1y: "0", p2x: "0", p2y: "6" }, null, 1e-6);
+  assert.equal(invalidCenteredCircle.geometry, null, "I due punti devono essere equidistanti dal centro");
+
+  const tangentCircle = resolveConstructionGeometry("circle", "two-points", "center-tangent", { ...values, centerx: "0", centery: "5" }, { a: { x: -10, y: 0 }, b: { x: 10, y: 0 } }, 1e-6);
+  assert.equal(tangentCircle.geometry?.type, "circle");
+  assert(Math.abs(tangentCircle.geometry.r - 5) < 1e-10);
+  assert(Math.abs(tangentCircle.geometry.tangentPoint.x) < 1e-10 && Math.abs(tangentCircle.geometry.tangentPoint.y) < 1e-10);
 
   const openPath = [[{ x: -10, y: 0 }, { x: 10, y: 0 }]];
   const openHit = nearestPathLocation(openPath, { x: 0, y: 0 });
@@ -45,7 +74,7 @@ try {
   const noCut = trimPathAtLocation(openPath, openHit, [], 1e-6);
   assert.equal(noCut, null, "Senza intersezioni non deve avvenire alcun taglio");
 
-  console.log("Interfaccia renderizzata · taglio geometrico: 3 scenari superati");
+  console.log("Interfaccia v1.2 · costruzioni geometriche: 6 scenari · taglio intelligente: 3 scenari superati");
 } finally {
   await server.close();
 }
