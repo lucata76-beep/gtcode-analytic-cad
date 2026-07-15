@@ -1,6 +1,16 @@
-# GT.Code Analytic CAD v1.2.0
+# GT.Code Analytic CAD v1.3.0
 
 Applicazione CAD matematica 2D eseguita interamente nel browser. Permette di inserire funzioni esplicite, equazioni implicite e curve parametriche, calcolare intersezioni numeriche, disegnare entità semplici con snap e trasformare punti o curve campionate in G-code Fanuc G0/G1.
+
+## Novità v1.3.0
+
+- costruzione di cerchi tangenti a due rette con raggio noto (`T1 + T2 + R`);
+- costruzione equivalente con diametro noto (`T1 + T2 + Ø`);
+- fino a quattro tangenze selezionabili direttamente sul canvas: T1/T2 obbligatorie e T3/T4 facoltative;
+- calcolo e anteprima delle possibili soluzioni S1–S4, selezionabili anche toccando il cerchio sul disegno;
+- shell automaticamente ridotta durante l’acquisizione di punti, rette di tangenza e soluzioni;
+- interrogazione completa delle circonferenze con centro X/Y, raggio e diametro;
+- caratteri dell’interfaccia aumentati di 2 px.
 
 ## Novità v1.2.0
 

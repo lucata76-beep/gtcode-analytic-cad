@@ -11,10 +11,10 @@ const server = await createServer({
 
 try {
   const module = await server.ssrLoadModule("/src/analytic-cad.tsx");
-  const { default: AnalyticCad, nearestPathLocation, trimPathAtLocation, resolveConstructionGeometry } = module;
+  const { default: AnalyticCad, nearestPathLocation, trimPathAtLocation, resolveConstructionGeometry, tangentCircleCandidates } = module;
 
   const markup = renderToStaticMarkup(React.createElement(AnalyticCad));
-  assert(markup.includes("GT.Code") && markup.includes("v1.2.0"), "L'interfaccia deve essere renderizzabile");
+  assert(markup.includes("GT.Code") && markup.includes("v1.3.0"), "L'interfaccia deve essere renderizzabile");
   assert(markup.includes(">Disegno<") && markup.includes(">Aiuto<") && markup.includes('aria-label="Guida"'), "Menu desktop e accesso alla guida devono essere disponibili");
 
   const values = {
@@ -45,6 +45,33 @@ try {
   assert(Math.abs(tangentCircle.geometry.r - 5) < 1e-10);
   assert(Math.abs(tangentCircle.geometry.tangentPoint.x) < 1e-10 && Math.abs(tangentCircle.geometry.tangentPoint.y) < 1e-10);
 
+  const horizontal = { a: { x: -10, y: 0 }, b: { x: 10, y: 0 } };
+  const vertical = { a: { x: 0, y: -10 }, b: { x: 0, y: 10 } };
+  const fixedRadiusCandidates = tangentCircleCandidates([horizontal, vertical], 2, 1e-6);
+  assert.equal(fixedRadiusCandidates.length, 4, "Due rette incidenti devono produrre quattro soluzioni T-T-R");
+  assert(fixedRadiusCandidates.every((candidate) => candidate.type === "circle" && Math.abs(Math.abs(candidate.c.x) - 2) < 1e-10 && Math.abs(Math.abs(candidate.c.y) - 2) < 1e-10));
+
+  const radiusResult = resolveConstructionGeometry("circle", "two-points", "tangencies-radius", { ...values, radius: "2", diameter: "4" }, null, 1e-6, [horizontal, vertical], 2);
+  assert.equal(radiusResult.candidates?.length, 4);
+  assert.equal(radiusResult.geometry?.type, "circle");
+  assert(Math.abs(radiusResult.geometry.r - 2) < 1e-10);
+
+  const diameterResult = resolveConstructionGeometry("circle", "two-points", "tangencies-diameter", { ...values, radius: "2", diameter: "4" }, null, 1e-6, [horizontal, vertical], 0);
+  assert.equal(diameterResult.geometry?.type, "circle");
+  assert(Math.abs(diameterResult.geometry.r - 2) < 1e-10);
+
+  const thirdConstant = 4 + 2 * Math.SQRT2;
+  const optionalThird = { a: { x: 0, y: thirdConstant }, b: { x: 1, y: thirdConstant - 1 } };
+  const fourthConstant = 2 * Math.SQRT2;
+  const optionalFourth = { a: { x: fourthConstant, y: 0 }, b: { x: fourthConstant + 1, y: 1 } };
+  const filteredCandidates = tangentCircleCandidates([horizontal, vertical, optionalThird, optionalFourth], 2, 1e-6);
+  assert.equal(filteredCandidates.length, 1, "T3 e T4 devono filtrare le soluzioni incompatibili");
+  assert(filteredCandidates[0].type === "circle" && Math.abs(filteredCandidates[0].c.x - 2) < 1e-9 && Math.abs(filteredCandidates[0].c.y - 2) < 1e-9);
+
+  const commaLine = resolveConstructionGeometry("line", "two-points", "three-points", { ...values, p1x: "-2,5", p1y: "1,5", p2x: "1,5", p2y: "1,5" }, null, 1e-6);
+  assert.equal(commaLine.geometry?.type, "line");
+  assert(Math.abs(commaLine.geometry.a.x + 2.5) < 1e-10 && Math.abs(commaLine.geometry.b.x - 1.5) < 1e-10, "Virgola e segno meno devono essere accettati");
+
   const openPath = [[{ x: -10, y: 0 }, { x: 10, y: 0 }]];
   const openHit = nearestPathLocation(openPath, { x: 0, y: 0 });
   assert(openHit, "Il tratto aperto deve essere individuato");
@@ -74,7 +101,7 @@ try {
   const noCut = trimPathAtLocation(openPath, openHit, [], 1e-6);
   assert.equal(noCut, null, "Senza intersezioni non deve avvenire alcun taglio");
 
-  console.log("Interfaccia v1.2 · costruzioni geometriche: 6 scenari · taglio intelligente: 3 scenari superati");
+  console.log("Interfaccia v1.3 · costruzioni geometriche: 11 scenari · taglio intelligente: 3 scenari superati");
 } finally {
   await server.close();
 }

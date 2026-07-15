@@ -82,13 +82,15 @@ type SnapState = Record<SnapKind, boolean>;
 type SnapHit = { point: Point; kind: SnapKind } | null;
 type Inspection = { curveId: string; point: Point; angle: number; slope: number };
 type LineMethod = "two-points" | "point-angle";
-type CircleMethod = "three-points" | "center-two-points" | "center-tangent";
+type CircleMethod = "three-points" | "center-two-points" | "center-tangent" | "tangencies-radius" | "tangencies-diameter";
 type PointField = "p1" | "p2" | "p3" | "center";
-type ConstructionField = "p1x" | "p1y" | "p2x" | "p2y" | "p3x" | "p3y" | "centerx" | "centery" | "angle" | "length";
+type ConstructionField = "p1x" | "p1y" | "p2x" | "p2y" | "p3x" | "p3y" | "centerx" | "centery" | "angle" | "length" | "radius" | "diameter";
 type ConstructionValues = Record<ConstructionField, string>;
 type ConstructionGeometry =
   | { type: "line"; a: Point; b: Point }
-  | { type: "circle"; c: Point; r: number; tangentPoint?: Point };
+  | { type: "circle"; c: Point; r: number; tangentPoint?: Point; tangentPoints?: Point[] };
+type ConstructionResult = { geometry: ConstructionGeometry | null; candidates?: ConstructionGeometry[]; error?: string };
+type TangentPickTarget = "center-tangent" | number | null;
 type MenuEntry = { label: string; action: () => void; checked?: boolean; disabled?: boolean; separator?: boolean; shortcut?: string };
 type AppMenu = { label: string; entries: MenuEntry[] };
 type PostSettings = {
@@ -107,7 +109,7 @@ type PostSettings = {
 };
 type PlotGeometry = { curve: Curve; segments: Segment[]; points: Point[]; paths?: Point[][]; error?: string };
 
-const VERSION = "1.2.0";
+const VERSION = "1.3.0";
 const COLORS = ["#ff8a1d", "#47c8ff", "#c985ff", "#73e0aa", "#f15b74", "#ffd166"];
 const DEFAULT_VIEW: View = { cx: 0, cy: 0, scale: 10 };
 const DEFAULT_PARAMS: Parameter[] = [
@@ -180,6 +182,7 @@ const DEFAULT_CONSTRUCTION_VALUES: ConstructionValues = {
   p3x: "10", p3y: "10",
   centerx: "0", centery: "0",
   angle: "0", length: "20",
+  radius: "2", diameter: "4",
 };
 
 const PRESETS: Array<{ name: string; type: CurveType; expression: string; note: string }> = [
@@ -509,6 +512,57 @@ export function circleThroughThreePoints(a: Point, b: Point, c: Point): { center
   return finitePoint(center) && Number.isFinite(radius) && radius > 1e-10 ? { center, radius } : null;
 }
 
+type NormalLine = { nx: number; ny: number; constant: number; source: Segment };
+
+function normalLine(segment: Segment): NormalLine | null {
+  const dx = segment.b.x - segment.a.x;
+  const dy = segment.b.y - segment.a.y;
+  const length = Math.hypot(dx, dy);
+  if (length <= 1e-12) return null;
+  const nx = -dy / length;
+  const ny = dx / length;
+  return { nx, ny, constant: nx * segment.a.x + ny * segment.a.y, source: segment };
+}
+
+export function tangentCircleCandidates(lines: Segment[], radius: number, tolerance: number): ConstructionGeometry[] {
+  if (lines.length < 2 || !Number.isFinite(radius) || radius <= 1e-10) return [];
+  const normalized = lines.map(normalLine).filter((line): line is NormalLine => Boolean(line));
+  if (normalized.length !== lines.length) return [];
+  const allowed = Math.max(tolerance, radius * 1e-5, 1e-7);
+  const candidates: ConstructionGeometry[] = [];
+
+  for (let first = 0; first < normalized.length; first += 1) {
+    for (let second = first + 1; second < normalized.length; second += 1) {
+      const lineA = normalized[first];
+      const lineB = normalized[second];
+      const determinant = lineA.nx * lineB.ny - lineA.ny * lineB.nx;
+      if (Math.abs(determinant) <= 1e-10) continue;
+      for (const sideA of [-1, 1]) {
+        for (const sideB of [-1, 1]) {
+          const constantA = lineA.constant + sideA * radius;
+          const constantB = lineB.constant + sideB * radius;
+          const center = {
+            x: (constantA * lineB.ny - lineA.ny * constantB) / determinant,
+            y: (lineA.nx * constantB - constantA * lineB.nx) / determinant,
+          };
+          if (!finitePoint(center)) continue;
+          const isTangentToAll = normalized.every((line) => Math.abs(Math.abs(line.nx * center.x + line.ny * center.y - line.constant) - radius) <= allowed);
+          if (!isTangentToAll || candidates.some((candidate) => candidate.type === "circle" && distance(candidate.c, center) <= allowed * 2)) continue;
+          const tangentPoints = normalized
+            .map((line) => projectOnInfiniteLine(center, line.source))
+            .filter((point): point is Point => Boolean(point));
+          candidates.push({ type: "circle", c: center, r: radius, tangentPoints });
+        }
+      }
+    }
+  }
+
+  return candidates.sort((first, second) => {
+    if (first.type !== "circle" || second.type !== "circle") return 0;
+    return first.c.y - second.c.y || first.c.x - second.c.x;
+  });
+}
+
 function parseConstructionNumber(value: string) {
   const normalized = value.trim().replace(/−/g, "-").replace(",", ".");
   if (!normalized || normalized === "-" || normalized === "." || normalized === "-.") return NaN;
@@ -533,7 +587,9 @@ export function resolveConstructionGeometry(
   values: ConstructionValues,
   tangentLine: Segment | null,
   tolerance: number,
-): { geometry: ConstructionGeometry | null; error?: string } {
+  tangentLines: Segment[] = [],
+  solutionIndex = 0,
+): ConstructionResult {
   if (kind === "line") {
     const p1 = constructionPoint(values, "p1");
     if (!p1) return { geometry: null, error: "Inserire coordinate valide per il punto 1" };
@@ -558,6 +614,17 @@ export function resolveConstructionGeometry(
     if (!p1 || !p2 || !p3) return { geometry: null, error: "Inserire tre punti validi" };
     const circle = circleThroughThreePoints(p1, p2, p3);
     return circle ? { geometry: { type: "circle", c: circle.center, r: circle.radius } } : { geometry: null, error: "I tre punti sono allineati o troppo vicini" };
+  }
+
+  if (circleMethod === "tangencies-radius" || circleMethod === "tangencies-diameter") {
+    const size = parseConstructionNumber(circleMethod === "tangencies-radius" ? values.radius : values.diameter);
+    const radius = circleMethod === "tangencies-radius" ? size : size / 2;
+    if (!Number.isFinite(size) || size <= 0) return { geometry: null, error: `${circleMethod === "tangencies-radius" ? "Il raggio" : "Il diametro"} deve essere maggiore di zero` };
+    if (tangentLines.length < 2) return { geometry: null, error: "Selezionare almeno Tangenza 1 e Tangenza 2 sul canvas" };
+    const candidates = tangentCircleCandidates(tangentLines, radius, tolerance);
+    if (!candidates.length) return { geometry: null, candidates: [], error: "Nessun cerchio soddisfa tutte le tangenze con questa misura" };
+    const selectedIndex = ((solutionIndex % candidates.length) + candidates.length) % candidates.length;
+    return { geometry: candidates[selectedIndex], candidates };
   }
 
   const center = constructionPoint(values, "center");
@@ -974,8 +1041,13 @@ export default function AnalyticCad() {
   const [constructionValues, setConstructionValues] = useState<ConstructionValues>(DEFAULT_CONSTRUCTION_VALUES);
   const [activeConstructionField, setActiveConstructionField] = useState<ConstructionField>("p1x");
   const [constructionPickTarget, setConstructionPickTarget] = useState<PointField | null>(null);
-  const [tangentPickMode, setTangentPickMode] = useState(false);
+  const [tangentPickTarget, setTangentPickTarget] = useState<TangentPickTarget>(null);
   const [tangentLineId, setTangentLineId] = useState<string | null>(null);
+  const [tangentConstraintIds, setTangentConstraintIds] = useState<Array<string | null>>([null, null, null, null]);
+  const [tangentSlotCount, setTangentSlotCount] = useState(2);
+  const [circleSolutionIndex, setCircleSolutionIndex] = useState(0);
+  const [solutionPickMode, setSolutionPickMode] = useState(false);
+  const [constructionShellMinimized, setConstructionShellMinimized] = useState(false);
   const [post, setPost] = useState<PostSettings>(DEFAULT_POST);
   const [tolerance, setTolerance] = useState(0.01);
   const [calcDomain, setCalcDomain] = useState({ xMin: -50, xMax: 50, yMin: -50, yMax: 50 });
@@ -999,10 +1071,21 @@ export default function AnalyticCad() {
   const selectedCurve = curves.find((curve) => curve.id === selectedCurveId) ?? null;
   const selectedDrawEntity = drawEntities.find((entity) => entity.id === selectedEntityId) ?? null;
   const tangentLine = drawEntities.find((entity): entity is Extract<DrawEntity, { type: "line" }> => entity.id === tangentLineId && entity.type === "line") ?? null;
+  const tangentConstraintLines = tangentConstraintIds.slice(0, tangentSlotCount).map((id) => drawEntities.find((entity): entity is Extract<DrawEntity, { type: "line" }> => entity.id === id && entity.type === "line") ?? null);
+  const activeTangentConstraintLines = tangentConstraintLines.filter((line): line is Extract<DrawEntity, { type: "line" }> => Boolean(line));
   const selectedGeometry = plotGeometries.find((geometry) => geometry.curve.id === selectedCurveId) ?? null;
   const constructionResult = useMemo(() => constructionShell
-    ? resolveConstructionGeometry(constructionShell, lineMethod, circleMethod, constructionValues, tangentLine ? { a: tangentLine.a, b: tangentLine.b } : null, tolerance)
-    : { geometry: null }, [constructionShell, lineMethod, circleMethod, constructionValues, tangentLine, tolerance]);
+    ? resolveConstructionGeometry(
+      constructionShell,
+      lineMethod,
+      circleMethod,
+      constructionValues,
+      tangentLine ? { a: tangentLine.a, b: tangentLine.b } : null,
+      tolerance,
+      activeTangentConstraintLines.map((line) => ({ a: line.a, b: line.b })),
+      circleSolutionIndex,
+    )
+    : { geometry: null }, [constructionShell, lineMethod, circleMethod, constructionValues, tangentLine, activeTangentConstraintLines, tolerance, circleSolutionIndex]);
   const gcode = useMemo(() => generateGCode(pathPoints, post), [pathPoints, post]);
   const gcodeChecks = useMemo(() => {
     const invalid = pathPoints.filter((point) => !finitePoint(point)).length;
@@ -1084,6 +1167,7 @@ export default function AnalyticCad() {
     setSelectedCurveId(snapshot.curves[0]?.id ?? "");
     setSelectedEntityId(null);
     setTangentLineId(null);
+    setTangentConstraintIds([null, null, null, null]);
     setInspection(null);
   };
 
@@ -1141,13 +1225,24 @@ export default function AnalyticCad() {
     setDraftStart(null);
     setDraftCurrent(null);
     setConstructionPickTarget(null);
-    setTangentPickMode(false);
+    setTangentPickTarget(null);
+    setSolutionPickMode(false);
+    setConstructionShellMinimized(false);
     if (nextTool === "line" || nextTool === "circle") {
       setConstructionShell(nextTool);
       if (nextTool === "circle" && selectedDrawEntity?.type === "line") {
-        setCircleMethod("center-tangent");
-        setTangentLineId(selectedDrawEntity.id);
-        setStatus("Retta selezionata automaticamente come tangenza");
+        if (circleMethod === "tangencies-radius" || circleMethod === "tangencies-diameter") {
+          setTangentConstraintIds((current) => {
+            if (current.includes(selectedDrawEntity.id)) return current;
+            const emptySlot = current.slice(0, tangentSlotCount).findIndex((id) => !id);
+            return emptySlot >= 0 ? current.map((id, index) => index === emptySlot ? selectedDrawEntity.id : id) : current;
+          });
+          setStatus("Retta selezionata aggiunta alle tangenze disponibili");
+        } else {
+          setCircleMethod("center-tangent");
+          setTangentLineId(selectedDrawEntity.id);
+          setStatus("Retta selezionata automaticamente come tangenza");
+        }
       } else setStatus(nextTool === "line" ? "Shell retta aperta · inserisci o acquisisci i punti" : "Shell cerchio aperta · scegli il metodo di costruzione");
     } else {
       setConstructionShell(null);
@@ -1163,14 +1258,51 @@ export default function AnalyticCad() {
 
   const requestConstructionPoint = (field: PointField) => {
     setConstructionPickTarget(field);
-    setTangentPickMode(false);
+    setTangentPickTarget(null);
+    setSolutionPickMode(false);
+    setConstructionShellMinimized(true);
     setStatus(`Acquisizione ${field === "center" ? "centro" : field.toUpperCase()} · tocca il disegno, gli snap sono attivi`);
   };
 
-  const requestTangentLine = () => {
-    setTangentPickMode(true);
+  const requestTangentLine = (target: Exclude<TangentPickTarget, null>) => {
+    setTangentPickTarget(target);
     setConstructionPickTarget(null);
-    setStatus("Tangenza automatica · seleziona una retta disegnata");
+    setSolutionPickMode(false);
+    setConstructionShellMinimized(true);
+    setStatus(target === "center-tangent" ? "Tangenza automatica · seleziona una retta disegnata" : `Tangenza ${target + 1} · tocca la retta sul canvas`);
+  };
+
+  const requestCircleSolution = () => {
+    if (!constructionResult.candidates?.length) {
+      setStatus(constructionResult.error ?? "Nessuna soluzione disponibile");
+      return;
+    }
+    setSolutionPickMode(true);
+    setConstructionPickTarget(null);
+    setTangentPickTarget(null);
+    setConstructionShellMinimized(true);
+    setStatus("Tocca il cerchio o il centro della soluzione desiderata");
+  };
+
+  const cancelConstructionAcquisition = () => {
+    setConstructionPickTarget(null);
+    setTangentPickTarget(null);
+    setSolutionPickMode(false);
+    setConstructionShellMinimized(false);
+    setStatus("Acquisizione annullata · shell ripristinata");
+  };
+
+  const changeCircleMethod = (method: CircleMethod) => {
+    setCircleMethod(method);
+    setCircleSolutionIndex(0);
+    setConstructionPickTarget(null);
+    setTangentPickTarget(null);
+    setSolutionPickMode(false);
+    setConstructionShellMinimized(false);
+    if ((method === "tangencies-radius" || method === "tangencies-diameter") && selectedDrawEntity?.type === "line" && !tangentConstraintIds[0]) {
+      setTangentConstraintIds((current) => [selectedDrawEntity.id, ...current.slice(1)]);
+      setStatus("Retta selezionata inserita come Tangenza 1");
+    } else setStatus(method === "tangencies-radius" ? "Seleziona T1 e T2 sul canvas, poi inserisci il raggio" : method === "tangencies-diameter" ? "Seleziona T1 e T2 sul canvas, poi inserisci il diametro" : "Metodo cerchio aggiornato");
   };
 
   const createConstructionEntity = () => {
@@ -1431,7 +1563,7 @@ export default function AnalyticCad() {
       const origin = worldToScreen({ x: 0, y: 0 });
       ctx.beginPath(); ctx.moveTo(0, origin.y); ctx.lineTo(w, origin.y); ctx.moveTo(origin.x, 0); ctx.lineTo(origin.x, h);
       ctx.strokeStyle = "rgba(203, 216, 228, .58)"; ctx.lineWidth = 1.3; ctx.stroke();
-      ctx.fillStyle = "rgba(201, 214, 226, .7)"; ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, monospace";
+      ctx.fillStyle = "rgba(201, 214, 226, .7)"; ctx.font = "14px ui-monospace, SFMono-Regular, Menlo, monospace";
       const xStart = Math.floor(bounds.xMin / step) * step;
       for (let x = xStart; x <= bounds.xMax; x += step) {
         if (Math.abs(x) < step / 10) continue;
@@ -1444,7 +1576,7 @@ export default function AnalyticCad() {
         const sy = worldToScreen({ x: 0, y }).y;
         ctx.fillText(fmt(y, 3), Math.min(w - 35, Math.max(5, origin.x + 5)), sy - 4);
       }
-      ctx.fillStyle = "#ff922d"; ctx.font = "bold 13px Inter, sans-serif";
+      ctx.fillStyle = "#ff922d"; ctx.font = "bold 15px Inter, sans-serif";
       ctx.fillText("X", w - 18, Math.min(h - 8, Math.max(16, origin.y - 8)));
       ctx.fillText("Y", Math.min(w - 18, Math.max(8, origin.x + 8)), 16);
     }
@@ -1465,10 +1597,11 @@ export default function AnalyticCad() {
     }
     for (const entity of drawEntities) {
       const selected = entity.id === selectedEntityId;
+      const tangentConstraintIndex = tangentConstraintIds.slice(0, tangentSlotCount).indexOf(entity.id);
       ctx.save();
-      ctx.strokeStyle = selected ? "#ffad4d" : "#e9edf2";
-      ctx.fillStyle = selected ? "#ffad4d" : "#e9edf2";
-      ctx.lineWidth = selected ? 2.8 : 1.6;
+      ctx.strokeStyle = selected ? "#ffad4d" : tangentConstraintIndex >= 0 ? "#63d7ff" : "#e9edf2";
+      ctx.fillStyle = selected ? "#ffad4d" : tangentConstraintIndex >= 0 ? "#63d7ff" : "#e9edf2";
+      ctx.lineWidth = selected ? 2.8 : tangentConstraintIndex >= 0 ? 2.3 : 1.6;
       if (selected) {
         ctx.shadowColor = "#ff8617";
         ctx.shadowBlur = 9;
@@ -1477,6 +1610,10 @@ export default function AnalyticCad() {
         const p = worldToScreen(entity.p); ctx.beginPath(); ctx.arc(p.x, p.y, selected ? 5 : 3.5, 0, Math.PI * 2); ctx.fill();
       } else if (entity.type === "line") {
         const a = worldToScreen(entity.a); const b = worldToScreen(entity.b); ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+        if (tangentConstraintIndex >= 0) {
+          ctx.font = "bold 13px Inter, sans-serif";
+          ctx.fillText(`T${tangentConstraintIndex + 1}`, (a.x + b.x) / 2 + 7, (a.y + b.y) / 2 - 7);
+        }
       } else if (entity.type === "polyline") {
         ctx.beginPath();
         entity.points.forEach((point, index) => {
@@ -1487,6 +1624,10 @@ export default function AnalyticCad() {
       } else {
         const c = worldToScreen(entity.c); ctx.beginPath(); ctx.arc(c.x, c.y, entity.r * view.scale, 0, Math.PI * 2); ctx.stroke();
         ctx.beginPath(); ctx.moveTo(c.x - 5, c.y); ctx.lineTo(c.x + 5, c.y); ctx.moveTo(c.x, c.y - 5); ctx.lineTo(c.x, c.y + 5); ctx.stroke();
+        if (selected) {
+          ctx.font = "bold 13px ui-monospace, monospace";
+          ctx.fillText(`C ${fmt(entity.c.x, 4)}, ${fmt(entity.c.y, 4)}  R ${fmt(entity.r, 4)}`, c.x + 9, c.y - 9);
+        }
       }
       ctx.restore();
     }
@@ -1502,7 +1643,29 @@ export default function AnalyticCad() {
       ctx.fillStyle = "#64d3ff";
       ctx.lineWidth = 1.8;
       const geometry = constructionResult.geometry;
-      if (geometry?.type === "line") {
+      const circleCandidates = (constructionResult.candidates ?? []).filter((candidate): candidate is Extract<ConstructionGeometry, { type: "circle" }> => candidate.type === "circle");
+      if (circleCandidates.length) {
+        circleCandidates.forEach((candidate, index) => {
+          const selected = geometry === candidate;
+          const center = worldToScreen(candidate.c);
+          ctx.save();
+          ctx.setLineDash(selected ? [7, 5] : [3, 6]);
+          ctx.globalAlpha = selected ? 1 : .43;
+          ctx.strokeStyle = selected ? "#64d3ff" : "#ffad4d";
+          ctx.fillStyle = selected ? "#64d3ff" : "#ffad4d";
+          ctx.lineWidth = selected ? 2.1 : 1.3;
+          ctx.beginPath(); ctx.arc(center.x, center.y, candidate.r * view.scale, 0, Math.PI * 2); ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.beginPath(); ctx.arc(center.x, center.y, selected ? 5 : 3.5, 0, Math.PI * 2); ctx.fill();
+          ctx.font = "bold 13px Inter, sans-serif";
+          ctx.fillText(`S${index + 1}`, center.x + 8, center.y - 8);
+          candidate.tangentPoints?.forEach((point) => {
+            const tangent = worldToScreen(point);
+            ctx.beginPath(); ctx.arc(tangent.x, tangent.y, 4, 0, Math.PI * 2); ctx.stroke();
+          });
+          ctx.restore();
+        });
+      } else if (geometry?.type === "line") {
         const a = worldToScreen(geometry.a); const b = worldToScreen(geometry.b);
         ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
       } else if (geometry?.type === "circle") {
@@ -1514,7 +1677,7 @@ export default function AnalyticCad() {
         }
       }
       ctx.setLineDash([]);
-      ctx.font = "bold 10px Inter, sans-serif";
+      ctx.font = "bold 12px Inter, sans-serif";
       for (const item of previewPoints) {
         const point = constructionPoint(constructionValues, item.key);
         if (!point) continue;
@@ -1560,7 +1723,7 @@ export default function AnalyticCad() {
       ctx.beginPath(); ctx.moveTo(p.x - dx, p.y - dy); ctx.lineTo(p.x + dx, p.y + dy); ctx.stroke();
       ctx.setLineDash([]);
       ctx.beginPath(); ctx.arc(p.x, p.y, 5, 0, Math.PI * 2); ctx.fillStyle = "#091018"; ctx.fill(); ctx.strokeStyle = "#78dcff"; ctx.lineWidth = 2; ctx.stroke();
-      ctx.font = "bold 11px Inter, sans-serif";
+      ctx.font = "bold 13px Inter, sans-serif";
       ctx.fillStyle = "#8de2ff";
       ctx.fillText(`TAN ${fmt(inspection.angle * 180 / Math.PI, 2)}°`, p.x + 10, p.y - 10);
       ctx.restore();
@@ -1577,7 +1740,7 @@ export default function AnalyticCad() {
       ctx.save(); ctx.setLineDash([4, 4]); ctx.strokeStyle = "#64d3ff"; ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
       const label = `L ${fmt(distance(measure.a, measure.b), 4)}  ΔX ${fmt(measure.b.x - measure.a.x, 4)}  ΔY ${fmt(measure.b.y - measure.a.y, 4)}`;
       const mx = (a.x + b.x) / 2; const my = (a.y + b.y) / 2;
-      ctx.font = "13px ui-monospace, monospace"; const width = ctx.measureText(label).width + 12;
+      ctx.font = "15px ui-monospace, monospace"; const width = ctx.measureText(label).width + 12;
       ctx.fillStyle = "rgba(6,12,19,.9)"; ctx.fillRect(mx - width / 2, my - 27, width, 21);
       ctx.fillStyle = "#8cddff"; ctx.fillText(label, mx - width / 2 + 6, my - 12); ctx.restore();
     }
@@ -1590,9 +1753,9 @@ export default function AnalyticCad() {
       } else {
         ctx.strokeRect(p.x - 6, p.y - 6, 12, 12);
       }
-      ctx.font = "bold 12px Inter, sans-serif"; ctx.fillText(snapHit.kind.toUpperCase(), p.x + 10, p.y - 10); ctx.restore();
+      ctx.font = "bold 14px Inter, sans-serif"; ctx.fillText(snapHit.kind.toUpperCase(), p.x + 10, p.y - 10); ctx.restore();
     }
-  }, [canvasSize, view, bounds, gridVisible, axesVisible, plotGeometries, selectedCurveId, selectedEntityId, drawEntities, constructionShell, constructionResult, constructionValues, lineMethod, circleMethod, pathPoints, post.closePath, intersections, selectedIntersectionId, inspection, draftStart, draftCurrent, tool, measure, snapHit, worldToScreen]);
+  }, [canvasSize, view, bounds, gridVisible, axesVisible, plotGeometries, selectedCurveId, selectedEntityId, drawEntities, tangentConstraintIds, tangentSlotCount, constructionShell, constructionResult, constructionValues, lineMethod, circleMethod, pathPoints, post.closePath, intersections, selectedIntersectionId, inspection, draftStart, draftCurrent, tool, measure, snapHit, worldToScreen]);
 
   const canvasPoint = (event: ReactPointerEvent<HTMLCanvasElement>): Point => {
     const rect = event.currentTarget.getBoundingClientRect();
@@ -1617,10 +1780,11 @@ export default function AnalyticCad() {
       setConstructionValues((current) => ({ ...current, [xField]: fmt(world.x, 6), [yField]: fmt(world.y, 6) }));
       setActiveConstructionField(xField);
       setConstructionPickTarget(null);
+      setConstructionShellMinimized(false);
       setStatus(`${constructionPickTarget === "center" ? "Centro" : constructionPickTarget.toUpperCase()} acquisito${hit ? ` con snap ${hit.kind}` : ""} · ${fmt(world.x, 5)}, ${fmt(world.y, 5)}`);
       return;
     }
-    if (tangentPickMode) {
+    if (tangentPickTarget !== null) {
       let nearestLine: { entity: Extract<DrawEntity, { type: "line" }>; distance: number } | null = null;
       for (const entity of drawEntities) {
         if (entity.type !== "line") continue;
@@ -1631,12 +1795,43 @@ export default function AnalyticCad() {
         setStatus("Nessuna retta trovata · tocca più vicino alla retta disegnata");
         return;
       }
-      setTangentLineId(nearestLine.entity.id);
+      if (tangentPickTarget === "center-tangent") {
+        setTangentLineId(nearestLine.entity.id);
+        setCircleMethod("center-tangent");
+      } else {
+        const duplicateSlot = tangentConstraintIds.findIndex((id, index) => index !== tangentPickTarget && id === nearestLine!.entity.id);
+        if (duplicateSlot >= 0) {
+          setStatus(`Questa retta è già impostata come Tangenza ${duplicateSlot + 1}`);
+          return;
+        }
+        setTangentConstraintIds((current) => current.map((id, index) => index === tangentPickTarget ? nearestLine!.entity.id : id));
+        setCircleSolutionIndex(0);
+      }
       setSelectedEntityId(nearestLine.entity.id);
       setSelectedCurveId("");
-      setCircleMethod("center-tangent");
-      setTangentPickMode(false);
-      setStatus("Retta acquisita · il raggio viene calcolato perpendicolarmente dal centro");
+      const acquiredTarget = tangentPickTarget;
+      setTangentPickTarget(null);
+      setConstructionShellMinimized(false);
+      setStatus(acquiredTarget === "center-tangent" ? "Retta acquisita · il raggio viene calcolato perpendicolarmente dal centro" : `Tangenza ${acquiredTarget + 1} acquisita sul canvas`);
+      return;
+    }
+    if (solutionPickMode) {
+      const candidates = (constructionResult.candidates ?? []).filter((candidate): candidate is Extract<ConstructionGeometry, { type: "circle" }> => candidate.type === "circle");
+      let nearestSolution: { index: number; score: number } | null = null;
+      for (let index = 0; index < candidates.length; index += 1) {
+        const candidate = candidates[index];
+        const centerDistance = distance(rawWorld, candidate.c);
+        const score = Math.min(Math.abs(centerDistance - candidate.r), centerDistance * 0.35);
+        if (!nearestSolution || score < nearestSolution.score) nearestSolution = { index, score };
+      }
+      if (!nearestSolution || nearestSolution.score > 20 / view.scale) {
+        setStatus("Tocca più vicino al cerchio tratteggiato o al suo centro");
+        return;
+      }
+      setCircleSolutionIndex(nearestSolution.index);
+      setSolutionPickMode(false);
+      setConstructionShellMinimized(false);
+      setStatus(`Soluzione S${nearestSolution.index + 1} selezionata sul canvas`);
       return;
     }
     if (tool === "pan" || event.button === 1) {
@@ -1682,7 +1877,9 @@ export default function AnalyticCad() {
         setSelectedIntersectionId(null);
         setInspection(null);
         const type = nearestEntity.entity.type === "line" ? "Retta" : nearestEntity.entity.type === "circle" ? "Circonferenza" : nearestEntity.entity.type === "polyline" ? "Profilo tagliato" : "Punto";
-        setStatus(type + " selezionata · usa il cestino o il tasto Canc");
+        setStatus(nearestEntity.entity.type === "circle"
+          ? `Circonferenza interrogata · Centro X${fmt(nearestEntity.entity.c.x, 5)} Y${fmt(nearestEntity.entity.c.y, 5)} · R${fmt(nearestEntity.entity.r, 5)}`
+          : type + " selezionata · usa il cestino o il tasto Canc");
       } else if (nearest) {
         const dx = nearest.segment.b.x - nearest.segment.a.x;
         const dy = nearest.segment.b.y - nearest.segment.a.y;
@@ -1839,6 +2036,7 @@ export default function AnalyticCad() {
     setDrawEntities((current) => current.filter((entity) => entity.id !== id));
     setSelectedEntityId((current) => current === id ? null : current);
     setTangentLineId((current) => current === id ? null : current);
+    setTangentConstraintIds((current) => current.map((constraintId) => constraintId === id ? null : constraintId));
     setStatus("Entità disegnata eliminata · usa Annulla per ripristinare");
   };
 
@@ -1870,6 +2068,7 @@ export default function AnalyticCad() {
     setMeasure(null);
     setSelectedEntityId(null);
     setTangentLineId(null);
+    setTangentConstraintIds([null, null, null, null]);
     setStatus("Tutti i disegni sono stati cancellati · usa Annulla per ripristinare");
   };
 
@@ -1884,7 +2083,9 @@ export default function AnalyticCad() {
         setDraftStart(null);
         setDraftCurrent(null);
         setConstructionPickTarget(null);
-        setTangentPickMode(false);
+        setTangentPickTarget(null);
+        setSolutionPickMode(false);
+        setConstructionShellMinimized(false);
         setConstructionShell(null);
         setTool("select");
         setStatus("Comando annullato");
@@ -1977,7 +2178,9 @@ export default function AnalyticCad() {
       pushHistory(); setCurves(project.curves); setParams(project.params ?? DEFAULT_PARAMS); setIntersections(project.intersections ?? []);
       setDrawEntities(project.drawEntities ?? []); setPathPoints(project.pathPoints ?? []); setView(project.view ?? DEFAULT_VIEW);
       setPost({ ...DEFAULT_POST, ...(project.post ?? {}) }); setTolerance(project.tolerance ?? 0.01); setCalcDomain(project.calcDomain ?? calcDomain);
-      setSelectedCurveId(project.curves[0]?.id ?? ""); setSelectedEntityId(null); setStatus(`${file.name} aperto`);
+      setSelectedCurveId(project.curves[0]?.id ?? ""); setSelectedEntityId(null); setTangentLineId(null);
+      setTangentConstraintIds([null, null, null, null]); setTangentPickTarget(null); setSolutionPickMode(false);
+      setConstructionShellMinimized(false); setStatus(`${file.name} aperto`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Impossibile aprire il file");
     }
@@ -2005,6 +2208,11 @@ export default function AnalyticCad() {
   const curveName = (id: string) => curves.find((curve) => curve.id === id)?.name ?? "Curva";
   const drawEntityName = (entity: DrawEntity) => entity.type === "line" ? "Retta disegnata" : entity.type === "circle" ? "Circonferenza disegnata" : entity.type === "polyline" ? (entity.source ?? "Profilo tagliato") : "Punto disegnato";
   const selectedCurveError = selectedCurve ? sampledGeometry(selectedCurve, paramScope, calcDomain).error : undefined;
+  const constructionAcquisitionText = constructionPickTarget
+    ? `Tocca il punto ${constructionPickTarget === "center" ? "centro" : constructionPickTarget.toUpperCase()} sul disegno`
+    : tangentPickTarget !== null
+      ? tangentPickTarget === "center-tangent" ? "Tocca la retta di tangenza" : `Tocca la retta per Tangenza ${tangentPickTarget + 1}`
+      : solutionPickMode ? "Tocca il cerchio o il centro della soluzione desiderata" : "Tocca il canvas";
   const appMenus: AppMenu[] = [
     { label: "File", entries: [
       { label: "Apri progetto…", action: openProject, shortcut: "⌘O" },
@@ -2022,6 +2230,8 @@ export default function AnalyticCad() {
       { label: "Punto", action: () => activateTool("point"), checked: tool === "point" },
       { label: "Retta con coordinate…", action: () => activateTool("line"), checked: constructionShell === "line" },
       { label: "Cerchio con coordinate…", action: () => activateTool("circle"), checked: constructionShell === "circle" },
+      { label: "Cerchio Tangenza + Tangenza + R…", action: () => { activateTool("circle"); changeCircleMethod("tangencies-radius"); }, checked: constructionShell === "circle" && circleMethod === "tangencies-radius" },
+      { label: "Cerchio Tangenza + Tangenza + Ø…", action: () => { activateTool("circle"); changeCircleMethod("tangencies-diameter"); }, checked: constructionShell === "circle" && circleMethod === "tangencies-diameter" },
       { label: "Taglia intelligente", action: () => activateTool("trim"), checked: tool === "trim", separator: true },
       { label: "Misura", action: () => activateTool("measure"), checked: tool === "measure" },
     ] },
@@ -2157,7 +2367,7 @@ export default function AnalyticCad() {
           lineMethod={lineMethod}
           setLineMethod={setLineMethod}
           circleMethod={circleMethod}
-          setCircleMethod={setCircleMethod}
+          setCircleMethod={changeCircleMethod}
           values={constructionValues}
           updateValue={updateConstructionValue}
           activeField={activeConstructionField}
@@ -2165,17 +2375,36 @@ export default function AnalyticCad() {
           pickTarget={constructionPickTarget}
           onPickPoint={requestConstructionPoint}
           tangentLine={tangentLine}
-          tangentPickMode={tangentPickMode}
+          tangentLines={tangentConstraintLines}
+          tangentSlotCount={tangentSlotCount}
+          tangentPickTarget={tangentPickTarget}
           onPickTangentLine={requestTangentLine}
+          onClearTangent={(target) => {
+            if (target === "center-tangent") setTangentLineId(null);
+            else setTangentConstraintIds((current) => current.map((id, index) => index === target ? null : id));
+            setCircleSolutionIndex(0);
+          }}
+          onAddTangent={() => setTangentSlotCount((current) => Math.min(4, current + 1))}
+          onRemoveTangent={() => {
+            setTangentConstraintIds((current) => current.map((id, index) => index === tangentSlotCount - 1 ? null : id));
+            setTangentSlotCount((current) => Math.max(2, current - 1));
+            setCircleSolutionIndex(0);
+          }}
+          solutionIndex={circleSolutionIndex}
+          onSelectSolution={setCircleSolutionIndex}
+          onPickSolution={requestCircleSolution}
           snaps={snaps}
           setSnaps={setSnaps}
           result={constructionResult}
+          minimized={constructionShellMinimized}
+          acquisitionText={constructionAcquisitionText}
+          onCancelAcquisition={cancelConstructionAcquisition}
           onCreate={createConstructionEntity}
-          onClose={() => { setConstructionShell(null); setConstructionPickTarget(null); setTangentPickMode(false); }}
+          onClose={() => { setConstructionShell(null); setConstructionPickTarget(null); setTangentPickTarget(null); setSolutionPickMode(false); setConstructionShellMinimized(false); }}
         />}
         <canvas
           ref={canvasRef}
-          className={`cad-canvas tool-${tool} ${constructionPickTarget || tangentPickMode ? "is-picking" : ""}`}
+          className={`cad-canvas tool-${tool} ${constructionPickTarget || tangentPickTarget !== null || solutionPickMode ? "is-picking" : ""}`}
           aria-label="Area grafica cartesiana interattiva"
           onPointerDown={handlePointerDown}
           onPointerMove={handlePointerMove}
@@ -2189,7 +2418,7 @@ export default function AnalyticCad() {
         <div className="view-badge"><span>{fmt(1 / view.scale * 100, 3)} u / 100 px</span><b>XY</b></div>
         <div className="orientation-widget"><span className="y-axis">Y</span><span className="x-axis">X</span><i /></div>
         {(selectedCurve || selectedDrawEntity) && <div className="selection-float">
-          <span style={{ background: selectedCurve?.color ?? "#ffad4d" }} /><div><small>SELEZIONE</small><b>{selectedCurve ? selectedCurve.name : selectedDrawEntity ? drawEntityName(selectedDrawEntity) : ""}</b></div>
+          <span style={{ background: selectedCurve?.color ?? "#ffad4d" }} /><div><small>SELEZIONE</small><b>{selectedCurve ? selectedCurve.name : selectedDrawEntity ? drawEntityName(selectedDrawEntity) : ""}</b>{selectedDrawEntity?.type === "circle" && <em>C {fmt(selectedDrawEntity.c.x, 3)}, {fmt(selectedDrawEntity.c.y, 3)} · R {fmt(selectedDrawEntity.r, 3)}</em>}</div>
           {selectedCurve && <button type="button" onClick={addCurveToPath}>Crea percorso</button>}
           {selectedDrawEntity && selectedDrawEntity.type !== "point" && <button type="button" onClick={addDrawEntityToPath}>Crea percorso</button>}
           <IconButton className="selection-delete" label="Elimina selezione" onClick={deleteSelection}><Trash2 size={16} /></IconButton>
@@ -2222,7 +2451,7 @@ export default function AnalyticCad() {
               <dl><div><dt>Entità</dt><dd>{selectedCurve.name}</dd></div><div><dt>Tipo</dt><dd>{selectedCurve.type === "function" ? "Funzione esplicita" : selectedCurve.type === "implicit" ? "Equazione implicita" : "Curva parametrica"}</dd></div><div><dt>Campioni</dt><dd>{selectedGeometry?.points.length ?? 0}</dd></div><div><dt>Stato</dt><dd className={selectedCurveError ? "bad" : "good"}>{selectedCurveError ? "Errore" : "Valida"}</dd></div>{inspection?.curveId === selectedCurve.id && <><div><dt>Punto X / Y</dt><dd>{fmt(inspection.point.x, 4)} / {fmt(inspection.point.y, 4)}</dd></div><div><dt>Tangente</dt><dd>{fmt(inspection.angle * 180 / Math.PI, 3)}°</dd></div><div><dt>Pendenza</dt><dd>{Number.isFinite(inspection.slope) ? fmt(inspection.slope, 5) : "Verticale"}</dd></div></>}</dl>
               <div className="inspector-actions"><button type="button" className="secondary-button" disabled={!selectedGeometry?.points.length} onClick={addCurveToPath}><FileCode2 size={15} /> Converti</button><button type="button" className="danger-button" onClick={deleteSelection}><Trash2 size={15} /> Elimina</button></div>
             </> : selectedDrawEntity ? <>
-              <dl><div><dt>Entità</dt><dd>{drawEntityName(selectedDrawEntity)}</dd></div><div><dt>Tipo</dt><dd>{selectedDrawEntity.type}</dd></div><div><dt>Stato</dt><dd className="good">Selezionata</dd></div></dl>
+              <dl><div><dt>Entità</dt><dd>{drawEntityName(selectedDrawEntity)}</dd></div><div><dt>Tipo</dt><dd>{selectedDrawEntity.type}</dd></div>{selectedDrawEntity.type === "circle" && <><div><dt>Centro X</dt><dd>{fmt(selectedDrawEntity.c.x, 6)}</dd></div><div><dt>Centro Y</dt><dd>{fmt(selectedDrawEntity.c.y, 6)}</dd></div><div><dt>Raggio</dt><dd>{fmt(selectedDrawEntity.r, 6)}</dd></div><div><dt>Diametro</dt><dd>{fmt(selectedDrawEntity.r * 2, 6)}</dd></div></>}<div><dt>Stato</dt><dd className="good">Selezionata</dd></div></dl>
               <div className="inspector-actions">{selectedDrawEntity.type !== "point" && <button type="button" className="secondary-button" onClick={addDrawEntityToPath}><FileCode2 size={15} /> Converti</button>}<button type="button" className="danger-button" onClick={deleteSelection}><Trash2 size={15} /> Elimina</button></div>
             </> : <p className="muted-copy">Seleziona una curva, una retta, un cerchio o un punto nell’area grafica.</p>}
           </div>
@@ -2263,13 +2492,16 @@ export default function AnalyticCad() {
           <section><span className="help-number">01</span><div><h3>Orientarsi nell’interfaccia</h3><p><b>Sinistra:</b> formule e dominio. <b>Centro:</b> canvas CAD. <b>Destra:</b> strumenti verticali e risultati. Su iPhone i pannelli Formule, Disegno, Risultati e G-code si aprono lateralmente.</p></div></section>
           <section><span className="help-number">02</span><div><h3>Inserire formule</h3><p>Dal menu <b>Formule → Nuova formula</b>: esplicita <code>y=2*x+5</code>, implicita <code>x^2+y^2=900</code>, parametrica <code>x=20*cos(t); y=20*sin(t)</code>. Imposta dominio X/Y e tolleranza prima di calcolare le intersezioni.</p></div></section>
           <section><span className="help-number">03</span><div><h3>Retta con shell</h3><p>Scegli <b>Disegno → Retta con coordinate</b>. Metodo <b>Due punti</b>: compila P1 e P2. Metodo <b>Punto + angolo</b>: compila P1, angolo in gradi e lunghezza. Puoi digitare X/Y oppure usare <b>Acquisisci</b>.</p></div></section>
-          <section><span className="help-number">04</span><div><h3>Cerchio con shell</h3><p>Metodi disponibili: <b>tre punti noti</b>; <b>centro + due punti equidistanti</b>; <b>centro + tangenza a retta</b>. Per la tangenza, seleziona prima la retta oppure premi “Seleziona retta”: raggio e punto di tangenza sono calcolati automaticamente.</p></div></section>
+          <section><span className="help-number">04</span><div><h3>Cerchio con shell</h3><p>Metodi disponibili: <b>tre punti noti</b>; <b>centro + due punti equidistanti</b>; <b>centro + tangenza</b>; <b>tangenze + raggio</b>; <b>tangenze + diametro</b>. Il centro, il raggio e i punti di contatto vengono calcolati automaticamente.</p></div></section>
           <section><span className="help-number">05</span><div><h3>Tastiera CAD</h3><p>Tocca un campo X, Y, angolo o lunghezza. Il tastierino modifica quel campo e include numeri, virgola decimale, <b>segno meno −</b>, cancella carattere e pulizia completa. Sono accettati sia punto sia virgola decimale.</p></div></section>
-          <section><span className="help-number">06</span><div><h3>Snap dinamici</h3><p><b>Fine</b>, <b>Medio</b>, <b>Centro</b>, <b>Intersezione</b>, <b>Vicino</b> e <b>Tangente</b> possono essere attivati in tempo reale dalla shell, dal menu Snap o dal pannello Disegno. Durante “Acquisisci”, il punto agganciato riempie automaticamente X e Y.</p></div></section>
+          <section><span className="help-number">06</span><div><h3>Tangenze T1–T4</h3><p>Per un cerchio T-T-R o T-T-Ø seleziona <b>Tangenza 1</b> e <b>Tangenza 2</b> toccando le rette. Puoi aggiungere T3 e T4 come vincoli facoltativi. Le soluzioni S1–S4 sono visibili sul canvas: scegli il cerchio desiderato dai pulsanti oppure direttamente sul disegno.</p></div></section>
           <section><span className="help-number">07</span><div><h3>Selezione e taglio</h3><p>Con la freccia tocca una curva o entità: diventa arancione. Il cestino la elimina. Con le forbici tocca la porzione delimitata dalle intersezioni da rimuovere; usa <b>Annulla</b> o “Ripristina formula” per tornare indietro.</p></div></section>
           <section><span className="help-number">08</span><div><h3>Zoom e interrogazione</h3><p>Rotella o pinch per zoom, Panoramica per spostarsi, Zoom finestra per inquadrare un’area e doppio tocco per adattare tutto. La selezione di una curva mostra coordinate, pendenza e direzione della tangente.</p></div></section>
           <section><span className="help-number">09</span><div><h3>Percorso e G-code</h3><p>Converti una curva o entità selezionata in punti, controlla ordine e verso, poi apri <b>CNC → Postprocessor Fanuc</b>. Configura G54–G59, utensile, mandrino, avanzamenti, Z sicurezza e Z lavoro prima di esportare il file <code>.NC</code>.</p></div></section>
           <section><span className="help-number">10</span><div><h3>Salvare su iPhone</h3><p><b>File → Salva progetto</b> produce un file <code>.gtcad</code>. Nel menu Condividi scegli <b>Salva su File</b>, quindi iCloud Drive o una cartella locale. “Apri progetto” ricarica il file; il browser mantiene anche un backup automatico.</p></div></section>
+          <section><span className="help-number">11</span><div><h3>Acquisizione a schermo libero</h3><p>Quando premi <b>Acquisisci</b>, “Seleziona retta” o “Scegli soluzione”, la shell si riduce automaticamente per liberare il canvas. Appena tocchi il punto, la tangenza o la soluzione corretta, la finestra completa riappare con il dato acquisito.</p></div></section>
+          <section><span className="help-number">12</span><div><h3>Interrogare una circonferenza</h3><p>Attiva <b>Seleziona / interroga</b> e tocca il bordo di un cerchio disegnato. Sul canvas e nel pannello Proprietà vengono mostrati <b>centro X/Y</b>, raggio e diametro. Lo snap Centro permette anche di acquisire direttamente il centro.</p></div></section>
+          <section><span className="help-number">13</span><div><h3>Snap dinamici</h3><p><b>Fine</b>, <b>Medio</b>, <b>Centro</b>, <b>Intersezione</b>, <b>Vicino</b> e <b>Tangente</b> si attivano dalla shell, dal menu Snap o dal pannello Disegno. Durante “Acquisisci”, il punto agganciato riempie automaticamente X e Y.</p></div></section>
         </div>
         <div className="safety-note"><Info size={18} /><p><strong>Nota CNC:</strong> il programma è un risultato geometrico, non una validazione tecnologica. Verificare origine, Z, utensile, compensazione, staffaggio e collisioni sul controllo/simulatore prima dell’esecuzione.</p></div>
       </Modal>}
@@ -2354,7 +2586,9 @@ function TopMenuBar({ menus }: { menus: AppMenu[] }) {
 
 function ConstructionShell({
   kind, lineMethod, setLineMethod, circleMethod, setCircleMethod, values, updateValue, activeField, setActiveField,
-  pickTarget, onPickPoint, tangentLine, tangentPickMode, onPickTangentLine, snaps, setSnaps, result, onCreate, onClose,
+  pickTarget, onPickPoint, tangentLine, tangentLines, tangentSlotCount, tangentPickTarget, onPickTangentLine,
+  onClearTangent, onAddTangent, onRemoveTangent, solutionIndex, onSelectSolution, onPickSolution,
+  snaps, setSnaps, result, minimized, acquisitionText, onCancelAcquisition, onCreate, onClose,
 }: {
   kind: "line" | "circle";
   lineMethod: LineMethod; setLineMethod: (method: LineMethod) => void;
@@ -2362,9 +2596,16 @@ function ConstructionShell({
   values: ConstructionValues; updateValue: (field: ConstructionField, value: string) => void;
   activeField: ConstructionField; setActiveField: (field: ConstructionField) => void;
   pickTarget: PointField | null; onPickPoint: (field: PointField) => void;
-  tangentLine: Extract<DrawEntity, { type: "line" }> | null; tangentPickMode: boolean; onPickTangentLine: () => void;
+  tangentLine: Extract<DrawEntity, { type: "line" }> | null;
+  tangentLines: Array<Extract<DrawEntity, { type: "line" }> | null>;
+  tangentSlotCount: number; tangentPickTarget: TangentPickTarget;
+  onPickTangentLine: (target: Exclude<TangentPickTarget, null>) => void;
+  onClearTangent: (target: "center-tangent" | number) => void;
+  onAddTangent: () => void; onRemoveTangent: () => void;
+  solutionIndex: number; onSelectSolution: (index: number) => void; onPickSolution: () => void;
   snaps: SnapState; setSnaps: React.Dispatch<React.SetStateAction<SnapState>>;
-  result: { geometry: ConstructionGeometry | null; error?: string };
+  result: ConstructionResult;
+  minimized: boolean; acquisitionText: string; onCancelAcquisition: () => void;
   onCreate: () => void; onClose: () => void;
 }) {
   const numericField = (field: ConstructionField, label: string, suffix?: string) => <label className={`shell-number-field ${activeField === field ? "active" : ""}`}>
@@ -2398,18 +2639,36 @@ function ConstructionShell({
     } else updateValue(activeField, current === "0" ? key : current + key);
   };
 
+  const lineDescription = (line: Extract<DrawEntity, { type: "line" }> | null) => line
+    ? `P1 ${fmt(line.a.x, 3)}, ${fmt(line.a.y, 3)} → P2 ${fmt(line.b.x, 3)}, ${fmt(line.b.y, 3)}`
+    : "Nessuna retta selezionata";
+
+  const tangencyEditor = (slot: number) => {
+    const line = tangentLines[slot] ?? null;
+    const picking = tangentPickTarget === slot;
+    return <div className={`tangent-selector tangent-constraint ${picking ? "picking" : ""}`} key={slot}>
+      <div><b>Tangenza {slot + 1}{slot >= 2 ? " · facoltativa" : ""}</b><small>{lineDescription(line)}</small></div>
+      <span className="tangent-actions">
+        {line && <IconButton label={`Cancella tangenza ${slot + 1}`} onClick={() => onClearTangent(slot)}><X size={15} /></IconButton>}
+        <button type="button" onClick={() => onPickTangentLine(slot)}><MousePointerClick size={15} /> {picking ? "Tocca la retta…" : line ? "Cambia" : "Seleziona"}</button>
+      </span>
+    </div>;
+  };
+
   const geometry = result.geometry;
+  const fixedTangencies = circleMethod === "tangencies-radius" || circleMethod === "tangencies-diameter";
+  const selectedSolution = result.candidates?.length ? ((solutionIndex % result.candidates.length) + result.candidates.length) % result.candidates.length : 0;
   const summary = geometry?.type === "line"
     ? `P2 ${fmt(geometry.b.x, 5)}, ${fmt(geometry.b.y, 5)} · L ${fmt(distance(geometry.a, geometry.b), 5)}`
     : geometry?.type === "circle"
-      ? `C ${fmt(geometry.c.x, 5)}, ${fmt(geometry.c.y, 5)} · R ${fmt(geometry.r, 5)}`
+      ? `${fixedTangencies ? `S${selectedSolution + 1} · ` : ""}C ${fmt(geometry.c.x, 5)}, ${fmt(geometry.c.y, 5)} · R ${fmt(geometry.r, 5)} · Ø ${fmt(geometry.r * 2, 5)}`
       : result.error ?? "Compila i dati geometrici";
 
-  return <aside className="construction-shell" aria-label={`Shell ${kind === "line" ? "retta" : "cerchio"}`}>
+  return <aside className={`construction-shell ${minimized ? "minimized" : ""}`} aria-label={`Shell ${kind === "line" ? "retta" : "cerchio"}`}>
     <header className="construction-shell-head"><div>{kind === "line" ? <PencilRuler size={17} /> : <Circle size={17} />}<span><b>{kind === "line" ? "RETTA" : "CERCHIO"}</b><small>Costruzione geometrica</small></span></div><IconButton label="Chiudi shell" onClick={onClose}><X size={17} /></IconButton></header>
-    <div className="construction-shell-body">
+    {minimized ? <div className="construction-acquisition-strip"><MousePointerClick size={20} /><span><b>ACQUISIZIONE DAL CANVAS</b><small>{acquisitionText}</small></span><button type="button" onClick={onCancelAcquisition}>Annulla</button></div> : <div className="construction-shell-body">
       <label className="construction-method"><span>Metodo</span><select value={kind === "line" ? lineMethod : circleMethod} onChange={(event) => kind === "line" ? setLineMethod(event.target.value as LineMethod) : setCircleMethod(event.target.value as CircleMethod)}>
-        {kind === "line" ? <><option value="two-points">Due punti</option><option value="point-angle">Punto + angolo + lunghezza</option></> : <><option value="three-points">Tre punti noti</option><option value="center-two-points">Centro + due punti noti</option><option value="center-tangent">Centro + tangenza a retta</option></>}
+        {kind === "line" ? <><option value="two-points">Due punti</option><option value="point-angle">Punto + angolo + lunghezza</option></> : <><option value="three-points">Tre punti noti</option><option value="center-two-points">Centro + due punti noti</option><option value="center-tangent">Centro + tangenza a retta</option><option value="tangencies-radius">Tangenze + Raggio</option><option value="tangencies-diameter">Tangenze + Diametro</option></>}
       </select></label>
 
       {kind === "line" ? <>
@@ -2417,13 +2676,29 @@ function ConstructionShell({
         {lineMethod === "two-points" ? pointEditor("p2", "Punto 2") : <div className="shell-coordinate-grid angle-grid">{numericField("angle", "Angolo", "°")}{numericField("length", "Lunghezza", "mm")}</div>}
       </> : circleMethod === "three-points" ? <>
         {pointEditor("p1", "Punto 1")}{pointEditor("p2", "Punto 2")}{pointEditor("p3", "Punto 3")}
-      </> : <>
+      </> : circleMethod === "center-two-points" ? <>
         {pointEditor("center", "Centro")}
-        {circleMethod === "center-two-points" ? <>{pointEditor("p1", "Punto noto 1")}{pointEditor("p2", "Punto noto 2")}</> : <div className={`tangent-selector ${tangentPickMode ? "picking" : ""}`}>
-          <div><b>Retta di tangenza</b><small>{tangentLine ? `P1 ${fmt(tangentLine.a.x, 3)}, ${fmt(tangentLine.a.y, 3)} → P2 ${fmt(tangentLine.b.x, 3)}, ${fmt(tangentLine.b.y, 3)}` : "Nessuna retta selezionata"}</small></div>
-          <button type="button" onClick={onPickTangentLine}><MousePointerClick size={15} /> {tangentPickMode ? "Tocca la retta…" : "Seleziona retta"}</button>
-        </div>}
-      </>}
+        {pointEditor("p1", "Punto noto 1")}{pointEditor("p2", "Punto noto 2")}
+      </> : circleMethod === "center-tangent" ? <>
+        {pointEditor("center", "Centro")}
+        <div className={`tangent-selector ${tangentPickTarget === "center-tangent" ? "picking" : ""}`}>
+          <div><b>Retta di tangenza</b><small>{lineDescription(tangentLine)}</small></div>
+          <span className="tangent-actions">{tangentLine && <IconButton label="Cancella retta di tangenza" onClick={() => onClearTangent("center-tangent")}><X size={15} /></IconButton>}<button type="button" onClick={() => onPickTangentLine("center-tangent")}><MousePointerClick size={15} /> {tangentPickTarget === "center-tangent" ? "Tocca la retta…" : tangentLine ? "Cambia" : "Seleziona retta"}</button></span>
+        </div>
+      </> : <div className="multi-tangency-block">
+        <p className="tangency-instruction"><Target size={15} /> Seleziona sul canvas almeno due rette. T3 e T4 sono vincoli facoltativi.</p>
+        {Array.from({ length: tangentSlotCount }, (_, slot) => tangencyEditor(slot))}
+        <div className="tangency-slot-actions">
+          <button type="button" className="ghost-button small" disabled={tangentSlotCount >= 4} onClick={onAddTangent}><Plus size={14} /> Aggiungi tangenza</button>
+          {tangentSlotCount > 2 && <button type="button" className="ghost-button small" onClick={onRemoveTangent}><X size={14} /> Rimuovi T{tangentSlotCount}</button>}
+        </div>
+        <div className="shell-coordinate-grid angle-grid tangency-size-field">{circleMethod === "tangencies-radius" ? numericField("radius", "Raggio", "mm") : numericField("diameter", "Diametro", "mm")}</div>
+        <div className="circle-solutions">
+          <header><span>Soluzioni geometriche</span><b>{result.candidates?.length ?? 0}</b></header>
+          <div className="solution-buttons">{result.candidates?.map((_, index) => <button type="button" key={index} className={selectedSolution === index ? "active" : ""} onClick={() => onSelectSolution(index)}>S{index + 1}</button>)}</div>
+          <button type="button" className="secondary-button full small" disabled={!result.candidates?.length} onClick={onPickSolution}><MousePointerClick size={15} /> Scegli soluzione sul canvas</button>
+        </div>
+      </div>}
 
       <div className="shell-snaps"><span>SNAP DINAMICI</span><div>{(Object.keys(snaps) as SnapKind[]).map((kind) => <button type="button" key={kind} className={snaps[kind] ? "active" : ""} onClick={() => setSnaps((current) => ({ ...current, [kind]: !current[kind] }))}>{kind}</button>)}</div></div>
 
@@ -2431,7 +2706,7 @@ function ConstructionShell({
 
       <div className={`construction-summary ${geometry ? "valid" : "invalid"}`}><span>{geometry ? <Check size={15} /> : <Info size={15} />}</span><p>{summary}</p></div>
       <button type="button" className="primary-button full shell-create" disabled={!geometry} onClick={onCreate}><Plus size={16} /> Crea {kind === "line" ? "retta" : "cerchio"}</button>
-    </div>
+    </div>}
   </aside>;
 }
 
