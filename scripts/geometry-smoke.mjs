@@ -11,11 +11,21 @@ const server = await createServer({
 
 try {
   const module = await server.ssrLoadModule("/src/analytic-cad.tsx");
-  const { default: AnalyticCad, nearestPathLocation, trimPathAtLocation, resolveConstructionGeometry, tangentCircleCandidates } = module;
+  const {
+    default: AnalyticCad,
+    nearestPathLocation,
+    trimPathAtLocation,
+    resolveConstructionGeometry,
+    tangentCircleCandidates,
+    circleLineTangencyPoints,
+    drawEntityIntersections,
+    analyticEquationForEntity,
+    formatInquiryReport,
+  } = module;
 
   const markup = renderToStaticMarkup(React.createElement(AnalyticCad));
-  assert(markup.includes("GT.Code") && markup.includes("v1.3.0"), "L'interfaccia deve essere renderizzabile");
-  assert(markup.includes(">Disegno<") && markup.includes(">Aiuto<") && markup.includes('aria-label="Guida"'), "Menu desktop e accesso alla guida devono essere disponibili");
+  assert(markup.includes("GT.Code") && markup.includes("v1.4.0"), "L'interfaccia deve essere renderizzabile");
+  assert(markup.includes(">Disegno<") && markup.includes(">Interroga<") && markup.includes(">Aiuto<") && markup.includes('aria-label="Guida"'), "Menu desktop, interrogazione e guida devono essere disponibili");
 
   const values = {
     p1x: "0", p1y: "0", p2x: "20", p2y: "0", p3x: "0", p3y: "10",
@@ -68,6 +78,26 @@ try {
   assert.equal(filteredCandidates.length, 1, "T3 e T4 devono filtrare le soluzioni incompatibili");
   assert(filteredCandidates[0].type === "circle" && Math.abs(filteredCandidates[0].c.x - 2) < 1e-9 && Math.abs(filteredCandidates[0].c.y - 2) < 1e-9);
 
+  const queriedTangencies = circleLineTangencyPoints({ c: { x: 2, y: 2 }, r: 2 }, [horizontal, vertical], 1e-6);
+  assert.equal(queriedTangencies.length, 2, "Il cerchio deve restituire i due punti di tangenza con le rette");
+  assert(queriedTangencies.some((item) => Math.abs(item.point.x - 2) < 1e-10 && Math.abs(item.point.y) < 1e-10));
+  assert(queriedTangencies.some((item) => Math.abs(item.point.x) < 1e-10 && Math.abs(item.point.y - 2) < 1e-10));
+
+  const drawnCircle = { id: "circle", type: "circle", c: { x: 0, y: 0 }, r: 2 };
+  const tangentDrawnLine = { id: "line", type: "line", a: { x: -5, y: 2 }, b: { x: 5, y: 2 } };
+  const secantDrawnLine = { id: "secant", type: "line", a: { x: -5, y: 0 }, b: { x: 5, y: 0 } };
+  assert.equal(drawEntityIntersections(drawnCircle, tangentDrawnLine).length, 1, "Una tangenza deve produrre una sola intersezione geometrica");
+  assert.equal(drawEntityIntersections(drawnCircle, secantDrawnLine).length, 2, "Una secante deve produrre due intersezioni geometriche");
+
+  const lineEquation = analyticEquationForEntity({ id: "eq-line", type: "line", ...horizontal });
+  const circleEquation = analyticEquationForEntity(drawnCircle);
+  assert.equal(lineEquation?.type, "implicit");
+  assert(lineEquation.expression.includes("*x") && lineEquation.expression.includes("*y"));
+  assert(circleEquation?.expression.includes("^2") && circleEquation.expression.includes("= 2^2"));
+
+  const report = formatInquiryReport([{ id: "q1", name: "TG1", point: { x: 2, y: 0 }, kind: "tangency", source: "Cerchio ↔ Retta", details: "R=2" }], [], undefined, new Date("2026-07-15T12:00:00Z"));
+  assert(report.includes("V1.4.0") && report.includes("TG1 | TANGENZA | X=2 | Y=0") && report.includes("FINE REPORT"), "Il report TXT deve includere versione, nome e coordinate");
+
   const commaLine = resolveConstructionGeometry("line", "two-points", "three-points", { ...values, p1x: "-2,5", p1y: "1,5", p2x: "1,5", p2y: "1,5" }, null, 1e-6);
   assert.equal(commaLine.geometry?.type, "line");
   assert(Math.abs(commaLine.geometry.a.x + 2.5) < 1e-10 && Math.abs(commaLine.geometry.b.x - 1.5) < 1e-10, "Virgola e segno meno devono essere accettati");
@@ -101,7 +131,7 @@ try {
   const noCut = trimPathAtLocation(openPath, openHit, [], 1e-6);
   assert.equal(noCut, null, "Senza intersezioni non deve avvenire alcun taglio");
 
-  console.log("Interfaccia v1.3 · costruzioni geometriche: 11 scenari · taglio intelligente: 3 scenari superati");
+  console.log("Interfaccia v1.4 · costruzioni e interrogazioni: 17 scenari · taglio intelligente: 3 scenari superati");
 } finally {
   await server.close();
 }

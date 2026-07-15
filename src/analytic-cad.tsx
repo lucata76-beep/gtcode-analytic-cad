@@ -81,6 +81,17 @@ type SnapKind = "Fine" | "Medio" | "Centro" | "Intersezione" | "Vicino" | "Tange
 type SnapState = Record<SnapKind, boolean>;
 type SnapHit = { point: Point; kind: SnapKind } | null;
 type Inspection = { curveId: string; point: Point; angle: number; slope: number };
+type InquiryMode = "tangencies" | "intersections" | "point" | "curve" | "center" | "equation" | null;
+type InquiryKind = "tangency" | "intersection" | "point" | "curve" | "center" | "equation";
+type InquiryPoint = {
+  id: string;
+  name: string;
+  point: Point;
+  kind: InquiryKind;
+  source: string;
+  details: string;
+  equation?: string;
+};
 type LineMethod = "two-points" | "point-angle";
 type CircleMethod = "three-points" | "center-two-points" | "center-tangent" | "tangencies-radius" | "tangencies-diameter";
 type PointField = "p1" | "p2" | "p3" | "center";
@@ -109,7 +120,7 @@ type PostSettings = {
 };
 type PlotGeometry = { curve: Curve; segments: Segment[]; points: Point[]; paths?: Point[][]; error?: string };
 
-const VERSION = "1.3.0";
+const VERSION = "1.4.0";
 const COLORS = ["#ff8a1d", "#47c8ff", "#c985ff", "#73e0aa", "#f15b74", "#ffd166"];
 const DEFAULT_VIEW: View = { cx: 0, cy: 0, scale: 10 };
 const DEFAULT_PARAMS: Parameter[] = [
@@ -718,6 +729,188 @@ function entitySegments(entity: DrawEntity): Segment[] {
   return entityPaths(entity).flatMap(pathSegments);
 }
 
+function nearestPointOnDrawEntity(entity: DrawEntity, target: Point): { point: Point; distance: number; segment?: Segment } | null {
+  if (entity.type === "point") return { point: entity.p, distance: distance(target, entity.p) };
+  if (entity.type === "circle") {
+    const angle = Math.atan2(target.y - entity.c.y, target.x - entity.c.x);
+    const point = { x: entity.c.x + entity.r * Math.cos(angle), y: entity.c.y + entity.r * Math.sin(angle) };
+    return { point, distance: distance(target, point) };
+  }
+  let nearest: { point: Point; distance: number; segment: Segment } | null = null;
+  for (const segment of entitySegments(entity)) {
+    const point = nearestOnSegment(target, segment);
+    const d = distance(target, point);
+    if (!nearest || d < nearest.distance) nearest = { point, distance: d, segment };
+  }
+  return nearest;
+}
+
+function segmentCircleIntersections(segment: Segment, circle: Extract<DrawEntity, { type: "circle" }>): Point[] {
+  const dx = segment.b.x - segment.a.x;
+  const dy = segment.b.y - segment.a.y;
+  const fx = segment.a.x - circle.c.x;
+  const fy = segment.a.y - circle.c.y;
+  const a = dx * dx + dy * dy;
+  if (a <= 1e-20) return [];
+  const b = 2 * (fx * dx + fy * dy);
+  const c = fx * fx + fy * fy - circle.r * circle.r;
+  const discriminant = b * b - 4 * a * c;
+  if (discriminant < -1e-10) return [];
+  const root = Math.sqrt(Math.max(0, discriminant));
+  const values = [(-b - root) / (2 * a), (-b + root) / (2 * a)];
+  const points = values
+    .filter((t) => t >= -1e-8 && t <= 1 + 1e-8)
+    .map((t) => ({ x: segment.a.x + t * dx, y: segment.a.y + t * dy }));
+  return points.filter((point, index) => index === 0 || distance(point, points[0]) > 1e-8);
+}
+
+function circleCircleIntersections(first: Extract<DrawEntity, { type: "circle" }>, second: Extract<DrawEntity, { type: "circle" }>): Point[] {
+  const dx = second.c.x - first.c.x;
+  const dy = second.c.y - first.c.y;
+  const centerDistance = Math.hypot(dx, dy);
+  if (centerDistance <= 1e-12 || centerDistance > first.r + second.r + 1e-10 || centerDistance < Math.abs(first.r - second.r) - 1e-10) return [];
+  const along = (first.r * first.r - second.r * second.r + centerDistance * centerDistance) / (2 * centerDistance);
+  const heightSquared = first.r * first.r - along * along;
+  if (heightSquared < -1e-10) return [];
+  const height = Math.sqrt(Math.max(0, heightSquared));
+  const base = { x: first.c.x + along * dx / centerDistance, y: first.c.y + along * dy / centerDistance };
+  const offset = { x: -dy * height / centerDistance, y: dx * height / centerDistance };
+  const points = [
+    { x: base.x + offset.x, y: base.y + offset.y },
+    { x: base.x - offset.x, y: base.y - offset.y },
+  ];
+  return points.filter((point, index) => index === 0 || distance(point, points[0]) > 1e-8);
+}
+
+export function drawEntityIntersections(first: DrawEntity, second: DrawEntity): Point[] {
+  if (first.type === "point" || second.type === "point") return [];
+  if (first.type === "line" && second.type === "line") {
+    const point = segmentIntersection({ a: first.a, b: first.b }, { a: second.a, b: second.b });
+    return point ? [point] : [];
+  }
+  if (first.type === "circle" && second.type === "circle") return circleCircleIntersections(first, second);
+  if (first.type === "line" && second.type === "circle") return segmentCircleIntersections({ a: first.a, b: first.b }, second);
+  if (first.type === "circle" && second.type === "line") return segmentCircleIntersections({ a: second.a, b: second.b }, first);
+  const points: Point[] = [];
+  for (const firstSegment of entitySegments(first)) {
+    for (const secondSegment of entitySegments(second)) {
+      if (!segmentBoundsOverlap(firstSegment, secondSegment)) continue;
+      const point = segmentIntersection(firstSegment, secondSegment);
+      if (point && !points.some((candidate) => distance(candidate, point) <= 1e-7)) points.push(point);
+    }
+  }
+  return points;
+}
+
+export function circleLineTangencyPoints(
+  circle: { c: Point; r: number },
+  lines: Segment[],
+  tolerance: number,
+): Array<{ point: Point; lineIndex: number; error: number }> {
+  const allowed = Math.max(1e-8, tolerance);
+  return lines.flatMap((line, lineIndex) => {
+    const point = projectOnInfiniteLine(circle.c, line);
+    if (!point) return [];
+    const error = Math.abs(distance(circle.c, point) - circle.r);
+    return error <= allowed ? [{ point, lineIndex, error }] : [];
+  });
+}
+
+function preciseNumber(value: number) {
+  if (Math.abs(value) < 1e-12) return "0";
+  return Number(value.toPrecision(12)).toString();
+}
+
+function signedTerm(value: number, variable = "") {
+  const sign = value < 0 ? "-" : "+";
+  return `${sign} ${preciseNumber(Math.abs(value))}${variable}`;
+}
+
+export function analyticEquationForEntity(entity: DrawEntity): { type: CurveType; expression: string; title: string } | null {
+  if (entity.type === "line") {
+    const a = entity.a.y - entity.b.y;
+    const b = entity.b.x - entity.a.x;
+    const c = entity.a.x * entity.b.y - entity.b.x * entity.a.y;
+    const norm = Math.hypot(a, b);
+    if (norm <= 1e-12) return null;
+    const na = a / norm;
+    const nb = b / norm;
+    const nc = c / norm;
+    return {
+      type: "implicit",
+      expression: `${preciseNumber(na)}*x ${signedTerm(nb, "*y")} ${signedTerm(nc)} = 0`,
+      title: "Retta da geometria",
+    };
+  }
+  if (entity.type === "circle") {
+    const xShift = entity.c.x < 0 ? `+ ${preciseNumber(Math.abs(entity.c.x))}` : `- ${preciseNumber(entity.c.x)}`;
+    const yShift = entity.c.y < 0 ? `+ ${preciseNumber(Math.abs(entity.c.y))}` : `- ${preciseNumber(entity.c.y)}`;
+    return {
+      type: "implicit",
+      expression: `(x ${xShift})^2 + (y ${yShift})^2 = ${preciseNumber(entity.r)}^2`,
+      title: "Circonferenza da geometria",
+    };
+  }
+  return null;
+}
+
+function drawEntityInquiryDetails(entity: DrawEntity) {
+  if (entity.type === "point") return `Punto X=${fmt(entity.p.x, 6)} Y=${fmt(entity.p.y, 6)}`;
+  if (entity.type === "line") {
+    const length = distance(entity.a, entity.b);
+    const angle = Math.atan2(entity.b.y - entity.a.y, entity.b.x - entity.a.x) * 180 / Math.PI;
+    const equation = analyticEquationForEntity(entity)?.expression ?? "—";
+    return `L=${fmt(length, 6)}; angolo=${fmt(angle, 4)} deg; ${equation}`;
+  }
+  if (entity.type === "circle") return `C=(${fmt(entity.c.x, 6)}, ${fmt(entity.c.y, 6)}); R=${fmt(entity.r, 6)}; D=${fmt(entity.r * 2, 6)}`;
+  return `Polilinea; vertici=${entity.points.length}; lunghezza=${fmt(pathLength(entity.points), 6)}`;
+}
+
+const INQUIRY_KIND_LABELS: Record<InquiryKind, string> = {
+  tangency: "TANGENZA",
+  intersection: "INTERSEZIONE",
+  point: "PUNTO",
+  curve: "CURVA",
+  center: "CENTRO",
+  equation: "EQUAZIONE",
+};
+
+const INQUIRY_MODE_LABELS: Record<Exclude<InquiryMode, null>, string> = {
+  tangencies: "Interroga tangenze",
+  intersections: "Interroga intersezioni",
+  point: "Interroga punto",
+  curve: "Interroga curva",
+  center: "Interroga centro",
+  equation: "Crea equazione analitica",
+};
+
+export function formatInquiryReport(
+  inquiryPoints: InquiryPoint[],
+  intersections: Intersection[],
+  curveLabel: (id: string) => string = (id) => id,
+  generatedAt = new Date(),
+) {
+  const lines = [
+    `GT.CODE ANALYTIC CAD V${VERSION}`,
+    "REPORT PUNTI INTERROGATI E INTERSEZIONI",
+    `DATA: ${generatedAt.toLocaleString("it-IT")}`,
+    "UNITA: mm  |  PIANO: XY",
+    "",
+    `[PUNTI INTERROGATI: ${inquiryPoints.length}]`,
+  ];
+  if (!inquiryPoints.length) lines.push("Nessun punto interrogato.");
+  inquiryPoints.forEach((item) => {
+    lines.push(`${item.name} | ${INQUIRY_KIND_LABELS[item.kind]} | X=${fmt(item.point.x, 8)} | Y=${fmt(item.point.y, 8)} | ${item.source}`);
+    if (item.details) lines.push(`  DETTAGLI: ${item.details}`);
+    if (item.equation) lines.push(`  EQUAZIONE: ${item.equation}`);
+  });
+  lines.push("", `[INTERSEZIONI CALCOLATE: ${intersections.length}]`);
+  if (!intersections.length) lines.push("Nessuna intersezione calcolata.");
+  intersections.forEach((item, index) => lines.push(`IX${index + 1} | X=${fmt(item.x, 8)} | Y=${fmt(item.y, 8)} | ${curveLabel(item.curves[0])} x ${curveLabel(item.curves[1])}`));
+  lines.push("", "FINE REPORT", "Verificare sempre tolleranze, unita e origine prima dell'uso CNC.");
+  return lines.join("\n");
+}
+
 type PathLocation = {
   pathIndex: number;
   segmentIndex: number;
@@ -1026,7 +1219,11 @@ export default function AnalyticCad() {
   const [selectedCurveId, setSelectedCurveId] = useState<string>(DEFAULT_CURVES[0].id);
   const [selectedEntityId, setSelectedEntityId] = useState<string | null>(null);
   const [selectedIntersectionId, setSelectedIntersectionId] = useState<string | null>(null);
+  const [selectedInquiryId, setSelectedInquiryId] = useState<string | null>(null);
   const [inspection, setInspection] = useState<Inspection | null>(null);
+  const [inquiryMode, setInquiryMode] = useState<InquiryMode>(null);
+  const [inquiryPoints, setInquiryPoints] = useState<InquiryPoint[]>([]);
+  const [inquiryLabelsVisible, setInquiryLabelsVisible] = useState(true);
   const [mobilePanel, setMobilePanel] = useState<"formulas" | "draw" | "results" | "gcode" | null>(null);
   const [leftCollapsed, setLeftCollapsed] = useState(false);
   const [rightCollapsed, setRightCollapsed] = useState(false);
@@ -1070,6 +1267,7 @@ export default function AnalyticCad() {
   );
   const selectedCurve = curves.find((curve) => curve.id === selectedCurveId) ?? null;
   const selectedDrawEntity = drawEntities.find((entity) => entity.id === selectedEntityId) ?? null;
+  const selectedInquiryPoint = inquiryPoints.find((item) => item.id === selectedInquiryId) ?? null;
   const tangentLine = drawEntities.find((entity): entity is Extract<DrawEntity, { type: "line" }> => entity.id === tangentLineId && entity.type === "line") ?? null;
   const tangentConstraintLines = tangentConstraintIds.slice(0, tangentSlotCount).map((id) => drawEntities.find((entity): entity is Extract<DrawEntity, { type: "line" }> => entity.id === id && entity.type === "line") ?? null);
   const activeTangentConstraintLines = tangentConstraintLines.filter((line): line is Extract<DrawEntity, { type: "line" }> => Boolean(line));
@@ -1130,6 +1328,9 @@ export default function AnalyticCad() {
           setParams(project.params ?? DEFAULT_PARAMS);
           setDrawEntities(project.drawEntities ?? []);
           setPathPoints(project.pathPoints ?? []);
+          setIntersections(project.intersections ?? []);
+          setInquiryPoints(project.inquiryPoints ?? []);
+          setInquiryLabelsVisible(project.inquiryLabelsVisible ?? true);
           setPost({ ...DEFAULT_POST, ...(project.post ?? {}) });
           setView(project.view ?? DEFAULT_VIEW);
           setStatus("Backup locale ripristinato");
@@ -1142,19 +1343,19 @@ export default function AnalyticCad() {
 
   useEffect(() => {
     const timeout = setTimeout(() => {
-      const project = { app: "GT.Code Analytic CAD", version: VERSION, curves, params, drawEntities, pathPoints, post, view };
+      const project = { app: "GT.Code Analytic CAD", version: VERSION, curves, params, intersections, drawEntities, pathPoints, inquiryPoints, inquiryLabelsVisible, post, view };
       localStorage.setItem("gtcode-analytic-autosave", JSON.stringify(project));
     }, 700);
     return () => clearTimeout(timeout);
-  }, [curves, params, drawEntities, pathPoints, post, view]);
+  }, [curves, params, intersections, drawEntities, pathPoints, inquiryPoints, inquiryLabelsVisible, post, view]);
 
   const pushHistory = useCallback(() => {
-    historyRef.current.push(JSON.stringify({ curves, params, drawEntities, pathPoints }));
+    historyRef.current.push(JSON.stringify({ curves, params, drawEntities, pathPoints, inquiryPoints }));
     historyRef.current = historyRef.current.slice(-30);
     futureRef.current = [];
     setCanUndo(true);
     setCanRedo(false);
-  }, [curves, params, drawEntities, pathPoints]);
+  }, [curves, params, drawEntities, pathPoints, inquiryPoints]);
 
   const restoreSnapshot = (json: string) => {
     const snapshot = JSON.parse(json);
@@ -1162,8 +1363,11 @@ export default function AnalyticCad() {
     setParams(snapshot.params);
     setDrawEntities(snapshot.drawEntities);
     setPathPoints(snapshot.pathPoints);
+    setInquiryPoints(snapshot.inquiryPoints ?? []);
     setIntersections([]);
     setSelectedIntersectionId(null);
+    setSelectedInquiryId(null);
+    setInquiryMode(null);
     setSelectedCurveId(snapshot.curves[0]?.id ?? "");
     setSelectedEntityId(null);
     setTangentLineId(null);
@@ -1174,7 +1378,7 @@ export default function AnalyticCad() {
   const undo = () => {
     const previous = historyRef.current.pop();
     if (!previous) return;
-    futureRef.current.push(JSON.stringify({ curves, params, drawEntities, pathPoints }));
+    futureRef.current.push(JSON.stringify({ curves, params, drawEntities, pathPoints, inquiryPoints }));
     restoreSnapshot(previous);
     setCanUndo(historyRef.current.length > 0);
     setCanRedo(true);
@@ -1183,7 +1387,7 @@ export default function AnalyticCad() {
   const redo = () => {
     const next = futureRef.current.pop();
     if (!next) return;
-    historyRef.current.push(JSON.stringify({ curves, params, drawEntities, pathPoints }));
+    historyRef.current.push(JSON.stringify({ curves, params, drawEntities, pathPoints, inquiryPoints }));
     restoreSnapshot(next);
     setCanUndo(true);
     setCanRedo(futureRef.current.length > 0);
@@ -1201,6 +1405,7 @@ export default function AnalyticCad() {
           { x: entity.c.x + entity.r, y: entity.c.y + entity.r },
         ];
       }),
+      ...inquiryPoints.map((item) => item.point),
       ...extraPoints,
     ].filter(finitePoint);
     if (!points.length) {
@@ -1218,9 +1423,10 @@ export default function AnalyticCad() {
       cy: (yMin + yMax) / 2,
       scale: Math.max(0.05, Math.min(2000, 0.82 * Math.min(canvasSize.width / width, canvasSize.height / height))),
     });
-  }, [plotGeometries, drawEntities, canvasSize]);
+  }, [plotGeometries, drawEntities, inquiryPoints, canvasSize]);
 
   const activateTool = (nextTool: Tool) => {
+    setInquiryMode(null);
     setTool(nextTool);
     setDraftStart(null);
     setDraftCurrent(null);
@@ -1322,6 +1528,310 @@ export default function AnalyticCad() {
     setInspection(null);
     const detail = entity.type === "line" ? `L ${fmt(distance(entity.a, entity.b), 5)}` : `R ${fmt(entity.r, 5)}`;
     setStatus(`${entity.type === "line" ? "Retta" : "Cerchio"} creato dalla shell · ${detail}`);
+  };
+
+  const appendInquiryPoints = (
+    drafts: Array<Omit<InquiryPoint, "id" | "name"> & { prefix: string }>,
+    recordHistory = true,
+  ) => {
+    const uniqueDrafts = drafts.filter((draft, index) => {
+      const duplicateExisting = inquiryPoints.some((item) => item.kind === draft.kind && item.source === draft.source && distance(item.point, draft.point) <= Math.max(1e-8, tolerance));
+      const duplicateDraft = drafts.slice(0, index).some((item) => item.kind === draft.kind && item.source === draft.source && distance(item.point, draft.point) <= Math.max(1e-8, tolerance));
+      return !duplicateExisting && !duplicateDraft;
+    });
+    if (!uniqueDrafts.length) return [] as InquiryPoint[];
+    const counters = new Map<string, number>();
+    for (const draft of uniqueDrafts) {
+      if (counters.has(draft.prefix)) continue;
+      const escaped = draft.prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const matcher = new RegExp(`^${escaped}(\\d+)$`, "i");
+      const maximum = inquiryPoints.reduce((value, item) => {
+        const match = item.name.match(matcher);
+        return match ? Math.max(value, Number(match[1])) : value;
+      }, 0);
+      counters.set(draft.prefix, maximum);
+    }
+    const additions = uniqueDrafts.map((draft) => {
+      const number = (counters.get(draft.prefix) ?? 0) + 1;
+      counters.set(draft.prefix, number);
+      const { prefix, ...data } = draft;
+      return { ...data, id: uid("query"), name: `${prefix}${number}` } satisfies InquiryPoint;
+    });
+    if (recordHistory) pushHistory();
+    setInquiryPoints((current) => [...current, ...additions]);
+    setSelectedInquiryId(additions[additions.length - 1].id);
+    return additions;
+  };
+
+  const activateInquiry = (mode: Exclude<InquiryMode, null>) => {
+    setInquiryMode(mode);
+    setTool("select");
+    setConstructionShell(null);
+    setConstructionPickTarget(null);
+    setTangentPickTarget(null);
+    setSolutionPickMode(false);
+    setConstructionShellMinimized(false);
+    setSelectedInquiryId(null);
+    const instructions: Record<Exclude<InquiryMode, null>, string> = {
+      tangencies: "Tocca una circonferenza: verranno individuate tutte le rette tangenti",
+      intersections: "Tocca vicino all'intersezione da interrogare",
+      point: "Tocca un punto sul canvas: gli snap sono attivi",
+      curve: "Tocca una curva, una retta, un cerchio o un profilo",
+      center: "Tocca una circonferenza per acquisirne il centro",
+      equation: "Tocca una retta o una circonferenza disegnata per crearne l'equazione",
+    };
+    setStatus(`${INQUIRY_MODE_LABELS[mode]} · ${instructions[mode]}`);
+  };
+
+  const clearInquiryPoints = () => {
+    if (!inquiryPoints.length) {
+      setStatus("Non ci sono punti interrogati da cancellare");
+      return;
+    }
+    pushHistory();
+    setInquiryPoints([]);
+    setSelectedInquiryId(null);
+    setStatus("Punti interrogati cancellati · usa Annulla per ripristinarli");
+  };
+
+  const renameInquiryPoint = (id: string) => {
+    const item = inquiryPoints.find((candidate) => candidate.id === id);
+    if (!item) return;
+    const name = window.prompt("Nuovo nome del punto interrogato", item.name)?.trim().replace(/[^a-zA-Z0-9_.-]/g, "").slice(0, 18);
+    if (!name || name === item.name) return;
+    if (inquiryPoints.some((candidate) => candidate.id !== id && candidate.name.toLowerCase() === name.toLowerCase())) {
+      setStatus(`Il nome ${name} è già utilizzato`);
+      return;
+    }
+    pushHistory();
+    setInquiryPoints((current) => current.map((candidate) => candidate.id === id ? { ...candidate, name } : candidate));
+    setStatus(`${item.name} rinominato in ${name}`);
+  };
+
+  const deleteInquiryPoint = (id: string) => {
+    const item = inquiryPoints.find((candidate) => candidate.id === id);
+    if (!item) return;
+    pushHistory();
+    setInquiryPoints((current) => current.filter((candidate) => candidate.id !== id));
+    setSelectedInquiryId((current) => current === id ? null : current);
+    setStatus(`${item.name} eliminato dal report`);
+  };
+
+  const findNearestDrawEntity = (world: Point, thresholdPx = 14) => {
+    let nearest: { entity: DrawEntity; point: Point; distance: number; segment?: Segment } | null = null;
+    for (const entity of drawEntities) {
+      const hit = nearestPointOnDrawEntity(entity, world);
+      if (hit && hit.distance <= thresholdPx / view.scale && (!nearest || hit.distance < nearest.distance)) nearest = { entity, ...hit };
+    }
+    return nearest;
+  };
+
+  const findNearestCurve = (world: Point, thresholdPx = 14) => {
+    let nearest: { geometry: PlotGeometry; point: Point; distance: number; segment: Segment } | null = null;
+    for (const geometry of plotGeometries) {
+      for (const segment of geometry.segments) {
+        const point = nearestOnSegment(world, segment);
+        const d = distance(world, point);
+        if (d <= thresholdPx / view.scale && (!nearest || d < nearest.distance)) nearest = { geometry, point, distance: d, segment };
+      }
+    }
+    return nearest;
+  };
+
+  const interrogateTangencies = (world: Point) => {
+    let circleHit: { entity: Extract<DrawEntity, { type: "circle" }>; distance: number } | null = null;
+    for (const entity of drawEntities) {
+      if (entity.type !== "circle") continue;
+      const hit = nearestPointOnDrawEntity(entity, world);
+      if (hit && hit.distance <= 18 / view.scale && (!circleHit || hit.distance < circleHit.distance)) circleHit = { entity, distance: hit.distance };
+    }
+    if (!circleHit) {
+      setStatus("Interroga tangenze · tocca più vicino al bordo della circonferenza disegnata");
+      return;
+    }
+    const lines = drawEntities.filter((entity): entity is Extract<DrawEntity, { type: "line" }> => entity.type === "line");
+    const allowed = Math.max(tolerance * 2, circleHit.entity.r * 1e-6, 1e-7);
+    const contacts = circleLineTangencyPoints(circleHit.entity, lines.map((line) => ({ a: line.a, b: line.b })), allowed);
+    setSelectedEntityId(circleHit.entity.id);
+    setSelectedCurveId("");
+    setSelectedIntersectionId(null);
+    if (!contacts.length) {
+      setStatus(`Nessuna retta tangente trovata entro la tolleranza ${fmt(allowed, 6)}`);
+      return;
+    }
+    const tangentIds = contacts.map((contact) => lines[contact.lineIndex].id).slice(0, 4);
+    setTangentSlotCount(Math.max(2, tangentIds.length));
+    setTangentConstraintIds(Array.from({ length: 4 }, (_, index) => tangentIds[index] ?? null));
+    const additions = appendInquiryPoints(contacts.map((contact) => ({
+      prefix: "TG",
+      point: contact.point,
+      kind: "tangency" as const,
+      source: `Circonferenza ↔ Retta ${contact.lineIndex + 1}`,
+      details: `C=(${fmt(circleHit!.entity.c.x, 6)}, ${fmt(circleHit!.entity.c.y, 6)}); R=${fmt(circleHit!.entity.r, 6)}; errore=${fmt(contact.error, 8)}`,
+    })));
+    setStatus(`${contacts.length} tangenz${contacts.length === 1 ? "a" : "e"} trovate${additions.length ? ` · create ${additions.map((item) => item.name).join(", ")}` : " · punti già presenti nel report"}`);
+  };
+
+  const interrogateIntersection = (world: Point, snap: SnapHit) => {
+    const candidates: Array<{ point: Point; source: string; details: string; intersectionId?: string }> = intersections.map((item) => ({
+      point: item,
+      source: `${curves.find((curve) => curve.id === item.curves[0])?.name ?? "Curva"} × ${curves.find((curve) => curve.id === item.curves[1])?.name ?? "Curva"}`,
+      details: "Intersezione calcolata tra entità matematiche",
+      intersectionId: item.id,
+    }));
+    for (let first = 0; first < drawEntities.length; first += 1) {
+      for (let second = first + 1; second < drawEntities.length; second += 1) {
+        drawEntityIntersections(drawEntities[first], drawEntities[second]).forEach((point) => candidates.push({
+          point,
+          source: `Entità ${first + 1} × Entità ${second + 1}`,
+          details: `${drawEntityInquiryDetails(drawEntities[first])} | ${drawEntityInquiryDetails(drawEntities[second])}`,
+        }));
+      }
+    }
+    const localRadius = 28 / view.scale;
+    const localSources: Array<{ id: string; name: string; kind: "curve" | "draw"; segments: Segment[] }> = [
+      ...plotGeometries.map((geometry) => ({
+        id: geometry.curve.id,
+        name: geometry.curve.name,
+        kind: "curve" as const,
+        segments: geometry.segments.filter((segment) => distance(world, nearestOnSegment(world, segment)) <= localRadius),
+      })),
+      ...drawEntities.filter((entity) => entity.type !== "point").map((entity, index) => ({
+        id: entity.id,
+        name: `${entity.type === "line" ? "Retta" : entity.type === "circle" ? "Circonferenza" : "Profilo"} ${index + 1}`,
+        kind: "draw" as const,
+        segments: entitySegments(entity).filter((segment) => distance(world, nearestOnSegment(world, segment)) <= localRadius),
+      })),
+    ].filter((source) => source.segments.length);
+    for (let first = 0; first < localSources.length; first += 1) {
+      for (let second = first + 1; second < localSources.length; second += 1) {
+        const firstSource = localSources[first];
+        const secondSource = localSources[second];
+        if (firstSource.kind === "draw" && secondSource.kind === "draw") continue;
+        for (const firstSegment of firstSource.segments) {
+          for (const secondSegment of secondSource.segments) {
+            if (!segmentBoundsOverlap(firstSegment, secondSegment)) continue;
+            const point = segmentIntersection(firstSegment, secondSegment);
+            if (!point || distance(point, world) > 22 / view.scale) continue;
+            if (!candidates.some((candidate) => distance(candidate.point, point) <= Math.max(1e-7, tolerance))) candidates.push({
+              point,
+              source: `${firstSource.name} × ${secondSource.name}`,
+              details: "Intersezione geometrica locale rilevata sul canvas",
+            });
+          }
+        }
+      }
+    }
+    if (snap?.kind === "Intersezione" && !candidates.some((candidate) => distance(candidate.point, snap.point) <= Math.max(1e-8, tolerance))) {
+      candidates.push({ point: snap.point, source: "Intersezione geometrica locale", details: "Rilevata mediante snap ad oggetto" });
+    }
+    const nearest = candidates.reduce<{ candidate: typeof candidates[number]; distance: number } | null>((best, candidate) => {
+      const d = distance(world, candidate.point);
+      return !best || d < best.distance ? { candidate, distance: d } : best;
+    }, null);
+    if (!nearest || nearest.distance > 20 / view.scale) {
+      setStatus("Nessuna intersezione vicina · tocca l'incrocio oppure calcola prima le intersezioni delle formule");
+      return;
+    }
+    const additions = appendInquiryPoints([{ prefix: "I", point: nearest.candidate.point, kind: "intersection", source: nearest.candidate.source, details: nearest.candidate.details }]);
+    if (nearest.candidate.intersectionId) setSelectedIntersectionId(nearest.candidate.intersectionId);
+    setStatus(additions.length ? `${additions[0].name} interrogata · X${fmt(additions[0].point.x, 6)} Y${fmt(additions[0].point.y, 6)}` : "Intersezione già presente nel report");
+  };
+
+  const interrogatePoint = (world: Point, snap: SnapHit) => {
+    const additions = appendInquiryPoints([{
+      prefix: "P",
+      point: world,
+      kind: "point",
+      source: snap ? `Snap ${snap.kind}` : "Coordinate canvas",
+      details: snap ? `Punto acquisito con snap ${snap.kind}` : "Punto libero interrogato sul piano XY",
+    }]);
+    if (additions.length) setStatus(`${additions[0].name} · X${fmt(world.x, 6)} Y${fmt(world.y, 6)}`);
+    else setStatus("Punto già presente nel report");
+  };
+
+  const interrogateCurve = (world: Point) => {
+    const drawHit = findNearestDrawEntity(world);
+    const curveHit = findNearestCurve(world);
+    if (!drawHit && !curveHit) {
+      setStatus("Interroga curva · tocca più vicino a una geometria visibile");
+      return;
+    }
+    if (drawHit && (!curveHit || drawHit.distance <= curveHit.distance)) {
+      setSelectedEntityId(drawHit.entity.id);
+      setSelectedCurveId("");
+      setInspection(null);
+      const source = drawHit.entity.type === "line" ? "Retta disegnata" : drawHit.entity.type === "circle" ? "Circonferenza disegnata" : drawHit.entity.type === "polyline" ? "Profilo disegnato" : "Punto disegnato";
+      const additions = appendInquiryPoints([{ prefix: "Q", point: drawHit.point, kind: "curve", source, details: drawEntityInquiryDetails(drawHit.entity) }]);
+      setStatus(additions.length ? `${additions[0].name} sulla ${source.toLowerCase()} · ${additions[0].details}` : "Punto della curva già presente nel report");
+      return;
+    }
+    if (!curveHit) return;
+    const dx = curveHit.segment.b.x - curveHit.segment.a.x;
+    const dy = curveHit.segment.b.y - curveHit.segment.a.y;
+    const angle = Math.atan2(dy, dx);
+    const slope = Math.abs(dx) < 1e-12 ? (dy >= 0 ? Infinity : -Infinity) : dy / dx;
+    setSelectedCurveId(curveHit.geometry.curve.id);
+    setSelectedEntityId(null);
+    setInspection({ curveId: curveHit.geometry.curve.id, point: curveHit.point, angle, slope });
+    const additions = appendInquiryPoints([{
+      prefix: "Q",
+      point: curveHit.point,
+      kind: "curve",
+      source: curveHit.geometry.curve.name,
+      details: `${curveHit.geometry.curve.expression}; tangente=${fmt(angle * 180 / Math.PI, 4)} deg; pendenza=${Number.isFinite(slope) ? fmt(slope, 7) : "verticale"}`,
+    }]);
+    setStatus(additions.length ? `${additions[0].name} su ${curveHit.geometry.curve.name} · tangente ${fmt(angle * 180 / Math.PI, 3)}°` : "Punto della curva già presente nel report");
+  };
+
+  const interrogateCenter = (world: Point) => {
+    let nearest: { entity: Extract<DrawEntity, { type: "circle" }>; distance: number } | null = null;
+    for (const entity of drawEntities) {
+      if (entity.type !== "circle") continue;
+      const edgeDistance = Math.abs(distance(world, entity.c) - entity.r);
+      const centerDistance = distance(world, entity.c);
+      const d = Math.min(edgeDistance, centerDistance);
+      if (d <= 18 / view.scale && (!nearest || d < nearest.distance)) nearest = { entity, distance: d };
+    }
+    if (!nearest) {
+      setStatus("Interroga centro · tocca il bordo o il centro di una circonferenza");
+      return;
+    }
+    setSelectedEntityId(nearest.entity.id);
+    setSelectedCurveId("");
+    const additions = appendInquiryPoints([{ prefix: "C", point: nearest.entity.c, kind: "center", source: "Centro circonferenza", details: drawEntityInquiryDetails(nearest.entity) }]);
+    setStatus(additions.length ? `${additions[0].name} · Centro X${fmt(nearest.entity.c.x, 6)} Y${fmt(nearest.entity.c.y, 6)}` : "Centro già presente nel report");
+  };
+
+  const createAnalyticEquation = (world: Point) => {
+    const hit = findNearestDrawEntity(world, 16);
+    if (!hit) {
+      setStatus("Crea equazione · tocca una retta o una circonferenza disegnata");
+      return;
+    }
+    const analytic = analyticEquationForEntity(hit.entity);
+    if (!analytic) {
+      setStatus("Questa entità non possiede una singola equazione analitica supportata");
+      return;
+    }
+    const curve: Curve = {
+      id: uid("curve"),
+      name: `${analytic.title} ${curves.filter((item) => item.name.startsWith(analytic.title)).length + 1}`,
+      type: analytic.type,
+      expression: analytic.expression,
+      color: COLORS[curves.length % COLORS.length],
+      visible: true,
+      domainMin: calcDomain.xMin,
+      domainMax: calcDomain.xMax,
+      samples: 140,
+    };
+    pushHistory();
+    setCurves((current) => [...current, curve]);
+    setSelectedCurveId(curve.id);
+    setSelectedEntityId(null);
+    setIntersections([]);
+    const additions = appendInquiryPoints([{ prefix: "E", point: hit.point, kind: "equation", source: curve.name, details: `Creata da ${hit.entity.type === "line" ? "retta" : "circonferenza"} disegnata`, equation: analytic.expression }], false);
+    setStatus(`Equazione creata: ${analytic.expression}${additions.length ? ` · riferimento ${additions[0].name}` : ""}`);
   };
 
   const findSnap = useCallback((world: Point, radiusPx = 13): SnapHit => {
@@ -1712,6 +2222,35 @@ export default function AnalyticCad() {
       ctx.beginPath(); ctx.moveTo(p.x - 9, p.y); ctx.lineTo(p.x + 9, p.y); ctx.moveTo(p.x, p.y - 9); ctx.lineTo(p.x, p.y + 9); ctx.strokeStyle = "rgba(255,211,109,.7)"; ctx.lineWidth = 1; ctx.stroke();
       ctx.restore();
     }
+    for (const item of inquiryPoints) {
+      const p = worldToScreen(item.point);
+      const selected = item.id === selectedInquiryId;
+      const color = item.kind === "tangency" ? "#64d3ff"
+        : item.kind === "intersection" ? "#ffd36d"
+          : item.kind === "center" ? "#66dda1"
+            : item.kind === "curve" ? "#c985ff"
+              : item.kind === "equation" ? "#f06a78" : "#ffad4d";
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.fillStyle = color;
+      ctx.lineWidth = selected ? 2.8 : 2;
+      if (selected) { ctx.shadowColor = color; ctx.shadowBlur = 11; }
+      ctx.beginPath(); ctx.arc(p.x, p.y, selected ? 7 : 5, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.moveTo(p.x - 10, p.y); ctx.lineTo(p.x + 10, p.y); ctx.moveTo(p.x, p.y - 10); ctx.lineTo(p.x, p.y + 10); ctx.stroke();
+      if (inquiryLabelsVisible) {
+        ctx.shadowBlur = 0;
+        ctx.font = "bold 13px ui-monospace, SFMono-Regular, Menlo, monospace";
+        const width = ctx.measureText(item.name).width + 12;
+        ctx.fillStyle = "rgba(7, 13, 20, .94)";
+        ctx.fillRect(p.x + 9, p.y - 24, width, 21);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1;
+        ctx.strokeRect(p.x + 9, p.y - 24, width, 21);
+        ctx.fillStyle = color;
+        ctx.fillText(item.name, p.x + 15, p.y - 9);
+      }
+      ctx.restore();
+    }
     if (inspection) {
       const p = worldToScreen(inspection.point);
       const dx = Math.cos(inspection.angle) * 42;
@@ -1755,7 +2294,7 @@ export default function AnalyticCad() {
       }
       ctx.font = "bold 14px Inter, sans-serif"; ctx.fillText(snapHit.kind.toUpperCase(), p.x + 10, p.y - 10); ctx.restore();
     }
-  }, [canvasSize, view, bounds, gridVisible, axesVisible, plotGeometries, selectedCurveId, selectedEntityId, drawEntities, tangentConstraintIds, tangentSlotCount, constructionShell, constructionResult, constructionValues, lineMethod, circleMethod, pathPoints, post.closePath, intersections, selectedIntersectionId, inspection, draftStart, draftCurrent, tool, measure, snapHit, worldToScreen]);
+  }, [canvasSize, view, bounds, gridVisible, axesVisible, plotGeometries, selectedCurveId, selectedEntityId, drawEntities, tangentConstraintIds, tangentSlotCount, constructionShell, constructionResult, constructionValues, lineMethod, circleMethod, pathPoints, post.closePath, intersections, selectedIntersectionId, inquiryPoints, selectedInquiryId, inquiryLabelsVisible, inspection, draftStart, draftCurrent, tool, measure, snapHit, worldToScreen]);
 
   const canvasPoint = (event: ReactPointerEvent<HTMLCanvasElement>): Point => {
     const rect = event.currentTarget.getBoundingClientRect();
@@ -1834,6 +2373,15 @@ export default function AnalyticCad() {
       setStatus(`Soluzione S${nearestSolution.index + 1} selezionata sul canvas`);
       return;
     }
+    if (inquiryMode) {
+      if (inquiryMode === "tangencies") interrogateTangencies(rawWorld);
+      else if (inquiryMode === "intersections") interrogateIntersection(rawWorld, hit);
+      else if (inquiryMode === "point") interrogatePoint(world, hit);
+      else if (inquiryMode === "curve") interrogateCurve(rawWorld);
+      else if (inquiryMode === "center") interrogateCenter(rawWorld);
+      else createAnalyticEquation(rawWorld);
+      return;
+    }
     if (tool === "pan" || event.button === 1) {
       dragRef.current = { startScreen: screen, startWorld: rawWorld, view };
       return;
@@ -1846,6 +2394,19 @@ export default function AnalyticCad() {
       return;
     }
     if (tool === "select") {
+      const queried = inquiryPoints.reduce<{ item: InquiryPoint; distance: number } | null>((best, item) => {
+        const d = distance(item.point, rawWorld);
+        return d < 14 / view.scale && (!best || d < best.distance) ? { item, distance: d } : best;
+      }, null);
+      if (queried) {
+        setSelectedInquiryId(queried.item.id);
+        setSelectedCurveId("");
+        setSelectedEntityId(null);
+        setSelectedIntersectionId(null);
+        setStatus(`${queried.item.name} · ${INQUIRY_KIND_LABELS[queried.item.kind]} · X${fmt(queried.item.point.x, 6)} Y${fmt(queried.item.point.y, 6)} · ${queried.item.source}`);
+        return;
+      }
+      setSelectedInquiryId(null);
       const ix = intersections.find((item) => distance(item, world) < 12 / view.scale);
       if (ix) {
         setSelectedIntersectionId(ix.id); setInspection(null); setStatus(`Intersezione X${fmt(ix.x)} Y${fmt(ix.y)}`); return;
@@ -2050,12 +2611,16 @@ export default function AnalyticCad() {
   };
 
   const deleteSelection = () => {
+    if (selectedInquiryId) {
+      deleteInquiryPoint(selectedInquiryId);
+      return;
+    }
     if (selectedEntityId) {
       deleteDrawEntity(selectedEntityId);
       return;
     }
     if (selectedCurveId && curves.some((curve) => curve.id === selectedCurveId)) deleteCurve(selectedCurveId);
-    else setStatus("Seleziona prima una curva, una retta o un punto");
+    else setStatus("Seleziona prima una curva, una retta o un punto interrogato");
   };
 
   const clearDrawings = () => {
@@ -2076,7 +2641,14 @@ export default function AnalyticCad() {
     const handleDeleteKey = (event: KeyboardEvent) => {
       const target = event.target;
       if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement || (target instanceof HTMLElement && target.isContentEditable)) return;
-      if (event.key === "Delete" || event.key === "Backspace") {
+      const key = event.key.toLowerCase();
+      if ((event.metaKey || event.ctrlKey) && key === "z") {
+        event.preventDefault();
+        if (event.shiftKey) redo(); else undo();
+      } else if ((event.metaKey || event.ctrlKey) && key === "y") {
+        event.preventDefault();
+        redo();
+      } else if (event.key === "Delete" || event.key === "Backspace") {
         event.preventDefault();
         deleteSelection();
       } else if (event.key === "Escape") {
@@ -2087,6 +2659,7 @@ export default function AnalyticCad() {
         setSolutionPickMode(false);
         setConstructionShellMinimized(false);
         setConstructionShell(null);
+        setInquiryMode(null);
         setTool("select");
         setStatus("Comando annullato");
       }
@@ -2152,7 +2725,7 @@ export default function AnalyticCad() {
   const saveProject = async () => {
     const project = {
       app: "GT.Code Analytic CAD", version: VERSION, savedAt: new Date().toISOString(),
-      curves, params, intersections, drawEntities, pathPoints, view, post, tolerance, calcDomain,
+      curves, params, intersections, drawEntities, pathPoints, inquiryPoints, inquiryLabelsVisible, view, post, tolerance, calcDomain,
     };
     const blob = new Blob([JSON.stringify(project, null, 2)], { type: "application/json" });
     setStatus(await saveFile(blob, `GT_CODE_${new Date().toISOString().slice(0, 10)}.gtcad`, "Progetto GT.Code Analytic CAD"));
@@ -2177,6 +2750,7 @@ export default function AnalyticCad() {
       if (project?.app !== "GT.Code Analytic CAD" || !Array.isArray(project.curves)) throw new Error("File non riconosciuto");
       pushHistory(); setCurves(project.curves); setParams(project.params ?? DEFAULT_PARAMS); setIntersections(project.intersections ?? []);
       setDrawEntities(project.drawEntities ?? []); setPathPoints(project.pathPoints ?? []); setView(project.view ?? DEFAULT_VIEW);
+      setInquiryPoints(project.inquiryPoints ?? []); setInquiryLabelsVisible(project.inquiryLabelsVisible ?? true); setSelectedInquiryId(null); setInquiryMode(null);
       setPost({ ...DEFAULT_POST, ...(project.post ?? {}) }); setTolerance(project.tolerance ?? 0.01); setCalcDomain(project.calcDomain ?? calcDomain);
       setSelectedCurveId(project.curves[0]?.id ?? ""); setSelectedEntityId(null); setTangentLineId(null);
       setTangentConstraintIds([null, null, null, null]); setTangentPickTarget(null); setSolutionPickMode(false);
@@ -2184,6 +2758,13 @@ export default function AnalyticCad() {
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Impossibile aprire il file");
     }
+  };
+
+  const saveInquiryReport = async () => {
+    const report = formatInquiryReport(inquiryPoints, intersections, (id) => curves.find((curve) => curve.id === id)?.name ?? id);
+    const blob = new Blob([report], { type: "text/plain;charset=utf-8" });
+    const result = await saveFile(blob, `GT_CODE_REPORT_INTERSEZIONI_${new Date().toISOString().slice(0, 10)}.txt`, "Report punti interrogati e intersezioni GT.Code");
+    setStatus(`${result} · report TXT con ${inquiryPoints.length} punti interrogati e ${intersections.length} intersezioni`);
   };
 
   const exportGCode = async () => {
@@ -2217,16 +2798,17 @@ export default function AnalyticCad() {
     { label: "File", entries: [
       { label: "Apri progetto…", action: openProject, shortcut: "⌘O" },
       { label: "Salva progetto…", action: saveProject, shortcut: "⌘S" },
+      { label: "Salva report punti intersezione (.txt)…", action: saveInquiryReport, disabled: !inquiryPoints.length && !intersections.length, separator: true },
       { label: "Esporta programma .NC", action: exportGCode, disabled: pathPoints.length < 2, separator: true },
     ] },
     { label: "Modifica", entries: [
       { label: "Annulla", action: undo, disabled: !canUndo, shortcut: "⌘Z" },
       { label: "Ripristina", action: redo, disabled: !canRedo },
-      { label: "Elimina selezione", action: deleteSelection, disabled: !selectedCurve && !selectedDrawEntity, separator: true },
+      { label: "Elimina selezione", action: deleteSelection, disabled: !selectedCurve && !selectedDrawEntity && !selectedInquiryPoint, separator: true },
       { label: "Cancella tutti i disegni", action: clearDrawings, disabled: !drawEntities.length },
     ] },
     { label: "Disegno", entries: [
-      { label: "Seleziona / interroga", action: () => activateTool("select"), checked: tool === "select" },
+      { label: "Seleziona", action: () => activateTool("select"), checked: tool === "select" && !inquiryMode },
       { label: "Punto", action: () => activateTool("point"), checked: tool === "point" },
       { label: "Retta con coordinate…", action: () => activateTool("line"), checked: constructionShell === "line" },
       { label: "Cerchio con coordinate…", action: () => activateTool("circle"), checked: constructionShell === "circle" },
@@ -2234,6 +2816,16 @@ export default function AnalyticCad() {
       { label: "Cerchio Tangenza + Tangenza + Ø…", action: () => { activateTool("circle"); changeCircleMethod("tangencies-diameter"); }, checked: constructionShell === "circle" && circleMethod === "tangencies-diameter" },
       { label: "Taglia intelligente", action: () => activateTool("trim"), checked: tool === "trim", separator: true },
       { label: "Misura", action: () => activateTool("measure"), checked: tool === "measure" },
+    ] },
+    { label: "Interroga", entries: [
+      { label: "Interroga tangenze", action: () => activateInquiry("tangencies"), checked: inquiryMode === "tangencies" },
+      { label: "Interroga intersezioni", action: () => activateInquiry("intersections"), checked: inquiryMode === "intersections" },
+      { label: "Interroga punto", action: () => activateInquiry("point"), checked: inquiryMode === "point" },
+      { label: "Interroga curva", action: () => activateInquiry("curve"), checked: inquiryMode === "curve" },
+      { label: "Interroga centro circonferenza", action: () => activateInquiry("center"), checked: inquiryMode === "center" },
+      { label: "Crea equazione di geometria analitica", action: () => activateInquiry("equation"), checked: inquiryMode === "equation", separator: true },
+      { label: inquiryLabelsVisible ? "Nascondi nomi punti" : "Mostra nomi punti", action: () => setInquiryLabelsVisible((current) => !current), checked: inquiryLabelsVisible, separator: true },
+      { label: "Cancella punti interrogati", action: clearInquiryPoints, disabled: !inquiryPoints.length },
     ] },
     { label: "Formule", entries: [
       { label: "Nuova formula…", action: () => setShowPresets(true) },
@@ -2272,6 +2864,10 @@ export default function AnalyticCad() {
           <div className="brand-copy"><strong>GT<span>.Code</span></strong><small>ANALYTIC CAD <b>v{VERSION}</b></small></div>
         </div>
         <div className="file-actions">
+          <div className="mobile-history-controls" aria-label="Cronologia operazioni">
+            <IconButton label="Annulla · torna indietro" onClick={undo} disabled={!canUndo}><Undo2 size={19} /></IconButton>
+            <IconButton label="Ripristina · ritorna avanti" onClick={redo} disabled={!canRedo}><Redo2 size={19} /></IconButton>
+          </div>
           <button type="button" className="text-button" onClick={openProject}><FolderOpen size={17} /> <span>Apri</span></button>
           <button type="button" className="text-button" onClick={saveProject}><Save size={17} /> <span>Salva</span></button>
           <button type="button" className="text-button accent" onClick={() => setShowGCode(true)}><FileCode2 size={17} /> <span>Postprocessor</span></button>
@@ -2352,7 +2948,7 @@ export default function AnalyticCad() {
             <button type="button" className="primary-button full" onClick={runIntersections}><Sparkles size={16} /> Calcola intersezioni</button>
           </div>
         </> : <div className="draw-mobile-content">
-          <DrawingControls tool={tool} setTool={activateTool} snaps={snaps} setSnaps={setSnaps} gridVisible={gridVisible} setGridVisible={setGridVisible} axesVisible={axesVisible} setAxesVisible={setAxesVisible} fitView={() => fitView()} clearDrawings={clearDrawings} deleteSelection={deleteSelection} canDeleteSelection={Boolean(selectedCurve || selectedDrawEntity)} />
+          <DrawingControls tool={tool} setTool={activateTool} snaps={snaps} setSnaps={setSnaps} gridVisible={gridVisible} setGridVisible={setGridVisible} axesVisible={axesVisible} setAxesVisible={setAxesVisible} fitView={() => fitView()} clearDrawings={clearDrawings} deleteSelection={deleteSelection} canDeleteSelection={Boolean(selectedCurve || selectedDrawEntity || selectedInquiryPoint)} />
         </div>}
       </section>
 
@@ -2360,7 +2956,7 @@ export default function AnalyticCad() {
 
       <section className="canvas-stage" ref={canvasWrapRef}>
         <div className="canvas-toolbar desktop-drawing-toolbar">
-          <DrawingControls compact tool={tool} setTool={activateTool} snaps={snaps} setSnaps={setSnaps} gridVisible={gridVisible} setGridVisible={setGridVisible} axesVisible={axesVisible} setAxesVisible={setAxesVisible} fitView={() => fitView()} clearDrawings={clearDrawings} deleteSelection={deleteSelection} canDeleteSelection={Boolean(selectedCurve || selectedDrawEntity)} />
+          <DrawingControls compact tool={tool} setTool={activateTool} snaps={snaps} setSnaps={setSnaps} gridVisible={gridVisible} setGridVisible={setGridVisible} axesVisible={axesVisible} setAxesVisible={setAxesVisible} fitView={() => fitView()} clearDrawings={clearDrawings} deleteSelection={deleteSelection} canDeleteSelection={Boolean(selectedCurve || selectedDrawEntity || selectedInquiryPoint)} />
         </div>
         {constructionShell && <ConstructionShell
           kind={constructionShell}
@@ -2404,7 +3000,7 @@ export default function AnalyticCad() {
         />}
         <canvas
           ref={canvasRef}
-          className={`cad-canvas tool-${tool} ${constructionPickTarget || tangentPickTarget !== null || solutionPickMode ? "is-picking" : ""}`}
+          className={`cad-canvas tool-${tool} ${constructionPickTarget || tangentPickTarget !== null || solutionPickMode || inquiryMode ? "is-picking" : ""}`}
           aria-label="Area grafica cartesiana interattiva"
           onPointerDown={handlePointerDown}
           onPointerMove={handlePointerMove}
@@ -2415,12 +3011,14 @@ export default function AnalyticCad() {
           onDoubleClick={() => fitView()}
           onContextMenu={(event) => event.preventDefault()}
         />
+        {inquiryMode && <div className="inquiry-mode-banner"><Target size={17} /><span><b>{INQUIRY_MODE_LABELS[inquiryMode]}</b><small>Tocca il disegno · punti salvati: {inquiryPoints.length}</small></span><button type="button" onClick={() => { setInquiryMode(null); setStatus("Modalità interrogazione terminata"); }} aria-label="Termina interrogazione"><X size={16} /></button></div>}
         <div className="view-badge"><span>{fmt(1 / view.scale * 100, 3)} u / 100 px</span><b>XY</b></div>
         <div className="orientation-widget"><span className="y-axis">Y</span><span className="x-axis">X</span><i /></div>
-        {(selectedCurve || selectedDrawEntity) && <div className="selection-float">
-          <span style={{ background: selectedCurve?.color ?? "#ffad4d" }} /><div><small>SELEZIONE</small><b>{selectedCurve ? selectedCurve.name : selectedDrawEntity ? drawEntityName(selectedDrawEntity) : ""}</b>{selectedDrawEntity?.type === "circle" && <em>C {fmt(selectedDrawEntity.c.x, 3)}, {fmt(selectedDrawEntity.c.y, 3)} · R {fmt(selectedDrawEntity.r, 3)}</em>}</div>
+        {(selectedCurve || selectedDrawEntity || selectedInquiryPoint) && <div className="selection-float">
+          <span style={{ background: selectedCurve?.color ?? (selectedInquiryPoint ? "#64d3ff" : "#ffad4d") }} /><div><small>{selectedInquiryPoint ? "PUNTO INTERROGATO" : "SELEZIONE"}</small><b>{selectedInquiryPoint ? selectedInquiryPoint.name : selectedCurve ? selectedCurve.name : selectedDrawEntity ? drawEntityName(selectedDrawEntity) : ""}</b>{selectedInquiryPoint && <em>X {fmt(selectedInquiryPoint.point.x, 4)} · Y {fmt(selectedInquiryPoint.point.y, 4)}</em>}{selectedDrawEntity?.type === "circle" && <em>C {fmt(selectedDrawEntity.c.x, 3)}, {fmt(selectedDrawEntity.c.y, 3)} · R {fmt(selectedDrawEntity.r, 3)}</em>}</div>
           {selectedCurve && <button type="button" onClick={addCurveToPath}>Crea percorso</button>}
           {selectedDrawEntity && selectedDrawEntity.type !== "point" && <button type="button" onClick={addDrawEntityToPath}>Crea percorso</button>}
+          {selectedInquiryPoint && <button type="button" onClick={() => renameInquiryPoint(selectedInquiryPoint.id)}>Rinomina</button>}
           <IconButton className="selection-delete" label="Elimina selezione" onClick={deleteSelection}><Trash2 size={16} /></IconButton>
         </div>}
       </section>
@@ -2433,21 +3031,34 @@ export default function AnalyticCad() {
         {mobilePanel !== "gcode" ? <>
           <div className="result-summary">
             <div><strong>{intersections.length}</strong><span>Intersezioni</span></div>
+            <div><strong>{inquiryPoints.length}</strong><span>Interrogati</span></div>
             <div><strong>{curves.filter((curve) => curve.visible).length}</strong><span>Curve attive</span></div>
           </div>
           <div className="results-list">
             {!intersections.length ? <div className="empty-state"><Crosshair size={30} /><strong>Nessun risultato</strong><p>Imposta il dominio e calcola le intersezioni tra almeno due curve visibili.</p></div> : intersections.map((item, index) => <article key={item.id} className={`result-card ${selectedIntersectionId === item.id ? "selected" : ""}`}>
               <button type="button" className="result-main" onClick={() => focusPoint(item, item.id)}>
-                <span className="point-index">P{index + 1}</span>
+                <span className="point-index">IX{index + 1}</span>
                 <span className="coordinates"><b>X {fmt(item.x, 6)}</b><b>Y {fmt(item.y, 6)}</b><small>{curveName(item.curves[0])} × {curveName(item.curves[1])}</small></span>
                 <Focus size={16} />
               </button>
               <button type="button" className="add-path-button" onClick={() => addPointToPath(item)}><Plus size={14} /> Percorso</button>
             </article>)}
           </div>
+          <div className="inquiry-results">
+            <header><div><Target size={15} /><span>Punti interrogati</span></div><button type="button" disabled={!inquiryPoints.length && !intersections.length} onClick={saveInquiryReport}><FileDown size={14} /> Report .TXT</button></header>
+            {!inquiryPoints.length ? <p>Nessun punto nominato. Usa il menu <b>Interroga</b> e tocca il canvas.</p> : <div className="inquiry-list">{inquiryPoints.map((item) => <article key={item.id} className={selectedInquiryId === item.id ? "selected" : ""}>
+              <button type="button" className="inquiry-focus" onClick={() => { focusPoint(item.point); setSelectedInquiryId(item.id); }}>
+                <span className="inquiry-name">{item.name}</span><span><b>{INQUIRY_KIND_LABELS[item.kind]}</b><small>X {fmt(item.point.x, 6)} · Y {fmt(item.point.y, 6)}</small><em>{item.source}</em></span><Focus size={15} />
+              </button>
+              <div className="inquiry-actions"><button type="button" onClick={() => renameInquiryPoint(item.id)}><PencilRuler size={13} /> Rinomina</button><button type="button" onClick={() => deleteInquiryPoint(item.id)}><Trash2 size={13} /> Elimina</button></div>
+            </article>)}</div>}
+          </div>
           <div className="inspector-block">
             <div className="section-title"><Info size={15} /> Proprietà selezione</div>
-            {selectedCurve ? <>
+            {selectedInquiryPoint ? <>
+              <dl><div><dt>Nome</dt><dd>{selectedInquiryPoint.name}</dd></div><div><dt>Tipo</dt><dd>{INQUIRY_KIND_LABELS[selectedInquiryPoint.kind]}</dd></div><div><dt>X</dt><dd>{fmt(selectedInquiryPoint.point.x, 8)}</dd></div><div><dt>Y</dt><dd>{fmt(selectedInquiryPoint.point.y, 8)}</dd></div><div><dt>Origine</dt><dd>{selectedInquiryPoint.source}</dd></div>{selectedInquiryPoint.equation && <div><dt>Equazione</dt><dd>{selectedInquiryPoint.equation}</dd></div>}</dl>
+              <div className="inspector-actions"><button type="button" className="secondary-button" onClick={() => renameInquiryPoint(selectedInquiryPoint.id)}><PencilRuler size={15} /> Rinomina</button><button type="button" className="danger-button" onClick={() => deleteInquiryPoint(selectedInquiryPoint.id)}><Trash2 size={15} /> Elimina</button></div>
+            </> : selectedCurve ? <>
               <dl><div><dt>Entità</dt><dd>{selectedCurve.name}</dd></div><div><dt>Tipo</dt><dd>{selectedCurve.type === "function" ? "Funzione esplicita" : selectedCurve.type === "implicit" ? "Equazione implicita" : "Curva parametrica"}</dd></div><div><dt>Campioni</dt><dd>{selectedGeometry?.points.length ?? 0}</dd></div><div><dt>Stato</dt><dd className={selectedCurveError ? "bad" : "good"}>{selectedCurveError ? "Errore" : "Valida"}</dd></div>{inspection?.curveId === selectedCurve.id && <><div><dt>Punto X / Y</dt><dd>{fmt(inspection.point.x, 4)} / {fmt(inspection.point.y, 4)}</dd></div><div><dt>Tangente</dt><dd>{fmt(inspection.angle * 180 / Math.PI, 3)}°</dd></div><div><dt>Pendenza</dt><dd>{Number.isFinite(inspection.slope) ? fmt(inspection.slope, 5) : "Verticale"}</dd></div></>}</dl>
               <div className="inspector-actions"><button type="button" className="secondary-button" disabled={!selectedGeometry?.points.length} onClick={addCurveToPath}><FileCode2 size={15} /> Converti</button><button type="button" className="danger-button" onClick={deleteSelection}><Trash2 size={15} /> Elimina</button></div>
             </> : selectedDrawEntity ? <>
@@ -2470,7 +3081,7 @@ export default function AnalyticCad() {
       <nav className="mobile-nav" aria-label="Pannelli applicazione">
         <button type="button" className={mobilePanel === "formulas" ? "active" : ""} onClick={() => setMobilePanel((current) => current === "formulas" ? null : "formulas")}><Sigma size={20} /><span>Formule</span></button>
         <button type="button" className={mobilePanel === "draw" ? "active" : ""} onClick={() => setMobilePanel((current) => current === "draw" ? null : "draw")}><PencilRuler size={20} /><span>Disegno</span></button>
-        <button type="button" className={mobilePanel === "results" ? "active" : ""} onClick={() => setMobilePanel((current) => current === "results" ? null : "results")}><Target size={20} /><span>Risultati</span>{intersections.length > 0 && <i>{intersections.length}</i>}</button>
+        <button type="button" className={mobilePanel === "results" ? "active" : ""} onClick={() => setMobilePanel((current) => current === "results" ? null : "results")}><Target size={20} /><span>Risultati</span>{intersections.length + inquiryPoints.length > 0 && <i>{intersections.length + inquiryPoints.length}</i>}</button>
         <button type="button" className={mobilePanel === "gcode" ? "active" : ""} onClick={() => setMobilePanel((current) => current === "gcode" ? null : "gcode")}><FileCode2 size={20} /><span>G-code</span>{pathPoints.length > 0 && <i>{pathPoints.length}</i>}</button>
       </nav>
 
@@ -2498,10 +3109,14 @@ export default function AnalyticCad() {
           <section><span className="help-number">07</span><div><h3>Selezione e taglio</h3><p>Con la freccia tocca una curva o entità: diventa arancione. Il cestino la elimina. Con le forbici tocca la porzione delimitata dalle intersezioni da rimuovere; usa <b>Annulla</b> o “Ripristina formula” per tornare indietro.</p></div></section>
           <section><span className="help-number">08</span><div><h3>Zoom e interrogazione</h3><p>Rotella o pinch per zoom, Panoramica per spostarsi, Zoom finestra per inquadrare un’area e doppio tocco per adattare tutto. La selezione di una curva mostra coordinate, pendenza e direzione della tangente.</p></div></section>
           <section><span className="help-number">09</span><div><h3>Percorso e G-code</h3><p>Converti una curva o entità selezionata in punti, controlla ordine e verso, poi apri <b>CNC → Postprocessor Fanuc</b>. Configura G54–G59, utensile, mandrino, avanzamenti, Z sicurezza e Z lavoro prima di esportare il file <code>.NC</code>.</p></div></section>
-          <section><span className="help-number">10</span><div><h3>Salvare su iPhone</h3><p><b>File → Salva progetto</b> produce un file <code>.gtcad</code>. Nel menu Condividi scegli <b>Salva su File</b>, quindi iCloud Drive o una cartella locale. “Apri progetto” ricarica il file; il browser mantiene anche un backup automatico.</p></div></section>
+          <section><span className="help-number">10</span><div><h3>Salvare su iPhone</h3><p><b>File → Salva progetto</b> produce un file <code>.gtcad</code>. <b>File → Salva report punti intersezione</b> produce invece un <code>.txt</code> con nomi, coordinate, sorgenti ed equazioni. Nel menu Condividi scegli <b>Salva su File</b>, quindi iCloud Drive.</p></div></section>
           <section><span className="help-number">11</span><div><h3>Acquisizione a schermo libero</h3><p>Quando premi <b>Acquisisci</b>, “Seleziona retta” o “Scegli soluzione”, la shell si riduce automaticamente per liberare il canvas. Appena tocchi il punto, la tangenza o la soluzione corretta, la finestra completa riappare con il dato acquisito.</p></div></section>
-          <section><span className="help-number">12</span><div><h3>Interrogare una circonferenza</h3><p>Attiva <b>Seleziona / interroga</b> e tocca il bordo di un cerchio disegnato. Sul canvas e nel pannello Proprietà vengono mostrati <b>centro X/Y</b>, raggio e diametro. Lo snap Centro permette anche di acquisire direttamente il centro.</p></div></section>
+          <section><span className="help-number">12</span><div><h3>Interrogare una circonferenza</h3><p>Dal menu <b>Interroga</b> scegli <b>Interroga curva</b>, <b>Interroga centro</b> oppure <b>Interroga tangenze</b>, quindi tocca il bordo del cerchio. Il pannello Proprietà mostra centro X/Y, raggio, diametro e punti nominati.</p></div></section>
           <section><span className="help-number">13</span><div><h3>Snap dinamici</h3><p><b>Fine</b>, <b>Medio</b>, <b>Centro</b>, <b>Intersezione</b>, <b>Vicino</b> e <b>Tangente</b> si attivano dalla shell, dal menu Snap o dal pannello Disegno. Durante “Acquisisci”, il punto agganciato riempie automaticamente X e Y.</p></div></section>
+          <section><span className="help-number">14</span><div><h3>Interrogare le tangenze</h3><p>Scegli <b>Interroga → Interroga tangenze</b> e tocca il cerchio. L’app confronta il raggio con la distanza perpendicolare di ogni retta dal centro, evidenzia le rette tangenti e marca i contatti come <b>TG1, TG2…</b>.</p></div></section>
+          <section><span className="help-number">15</span><div><h3>Punti nominati</h3><p>Le intersezioni diventano <b>I1…</b>, i punti liberi <b>P1…</b>, i punti sulle curve <b>Q1…</b> e i centri <b>C1…</b>. Apri <b>Risultati → Punti interrogati</b> per centrare, rinominare o eliminare ogni punto.</p></div></section>
+          <section><span className="help-number">16</span><div><h3>Creare un’equazione</h3><p>Scegli <b>Interroga → Crea equazione di geometria analitica</b> e tocca una retta o una circonferenza disegnata. Viene creata automaticamente una nuova equazione implicita modificabile nel pannello Formule.</p></div></section>
+          <section><span className="help-number">17</span><div><h3>Annulla e ritorna</h3><p>Le frecce curve nell’intestazione eseguono <b>Annulla</b> e <b>Ripristina</b>. Su tastiera puoi usare <code>Ctrl/⌘+Z</code>, <code>Ctrl/⌘+Shift+Z</code> oppure <code>Ctrl+Y</code>. Anche i punti interrogati fanno parte della cronologia.</p></div></section>
         </div>
         <div className="safety-note"><Info size={18} /><p><strong>Nota CNC:</strong> il programma è un risultato geometrico, non una validazione tecnologica. Verificare origine, Z, utensile, compensazione, staffaggio e collisioni sul controllo/simulatore prima dell’esecuzione.</p></div>
       </Modal>}
@@ -2511,6 +3126,7 @@ export default function AnalyticCad() {
           <label className="toggle-row"><span><Grid3X3 size={17} /><b>Griglia tecnica</b></span><input type="checkbox" checked={gridVisible} onChange={(event) => setGridVisible(event.target.checked)} /></label>
           <label className="toggle-row"><span><Crosshair size={17} /><b>Assi cartesiani</b></span><input type="checkbox" checked={axesVisible} onChange={(event) => setAxesVisible(event.target.checked)} /></label>
           <label className="toggle-row"><span><Aperture size={17} /><b>Snap ad oggetto</b></span><input type="checkbox" checked={Object.values(snaps).some(Boolean)} onChange={(event) => setSnaps(Object.fromEntries(Object.keys(snaps).map((key) => [key, event.target.checked])) as SnapState)} /></label>
+          <label className="toggle-row"><span><Target size={17} /><b>Nomi punti interrogati</b></span><input type="checkbox" checked={inquiryLabelsVisible} onChange={(event) => setInquiryLabelsVisible(event.target.checked)} /></label>
         </div>
         <button type="button" className="secondary-button full" onClick={() => { setView(DEFAULT_VIEW); setStatus("Vista iniziale ripristinata"); }}><RotateCcw size={16} /> Ripristina vista</button>
       </Modal>}

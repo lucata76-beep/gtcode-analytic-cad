@@ -1,6 +1,16 @@
-# GT.Code Analytic CAD v1.3.0
+# GT.Code Analytic CAD v1.4.0
 
 Applicazione CAD matematica 2D eseguita interamente nel browser. Permette di inserire funzioni esplicite, equazioni implicite e curve parametriche, calcolare intersezioni numeriche, disegnare entità semplici con snap e trasformare punti o curve campionate in G-code Fanuc G0/G1.
+
+## Novità v1.4.0
+
+- nuovo menu `Interroga` per tangenze, intersezioni, punti, curve e centri di circonferenze;
+- ricerca automatica dei contatti fra un cerchio selezionato e tutte le rette tangenti, con marcatori `TG1`, `TG2`…;
+- punti interrogati persistenti e nominati sul canvas (`I`, `P`, `Q`, `C`, `E`), rinominabili ed eliminabili;
+- creazione automatica dell’equazione analitica implicita di rette e circonferenze disegnate;
+- report completo salvabile in `.txt` da `File → Salva report punti intersezione`;
+- frecce Undo/Redo visibili anche su iPhone e scorciatoie `Ctrl/⌘+Z`, `Shift+Ctrl/⌘+Z` e `Ctrl+Y`;
+- punti interrogati inclusi nei progetti, nel backup locale e nella cronologia Annulla/Ripristina.
 
 ## Novità v1.3.0
 
@@ -14,7 +24,7 @@ Applicazione CAD matematica 2D eseguita interamente nel browser. Permette di ins
 
 ## Novità v1.2.0
 
-- menu superiori a tendina in stile applicazione desktop (`File`, `Modifica`, `Disegno`, `Formule`, `Vista`, `Snap`, `CNC`, `Aiuto`);
+- menu superiori a tendina in stile applicazione desktop (`File`, `Modifica`, `Disegno`, `Interroga`, `Formule`, `Vista`, `Snap`, `CNC`, `Aiuto`);
 - shell di costruzione per rette definite da due punti oppure da punto, angolo e lunghezza;
 - shell di costruzione per cerchi passanti per tre punti, con centro e due punti equidistanti, oppure con centro e tangenza automatica a una retta selezionata;
 - acquisizione dei punti direttamente dal canvas con snap dinamici a estremità, punti medi, centri, intersezioni, punti vicini e tangenze;
@@ -64,6 +74,7 @@ https://NOME-UTENTE.github.io/NOME-REPOSITORY/
 ## File e dati
 
 - I progetti vengono salvati come file `.gtcad`/JSON tramite il selettore file o il menu Condividi del dispositivo.
+- I report di punti interrogati, tangenze e intersezioni vengono salvati come file `.txt`.
 - Il backup automatico locale usa `localStorage` del browser.
 - I programmi CNC vengono esportati come file `.NC`.
 
