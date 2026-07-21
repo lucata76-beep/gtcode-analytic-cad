@@ -105,7 +105,17 @@ type ConstructionResult = { geometry: ConstructionGeometry | null; candidates?: 
 type TangentPickTarget = "center-tangent" | number | null;
 type MenuEntry = { label: string; action: () => void; checked?: boolean; disabled?: boolean; separator?: boolean; shortcut?: string };
 type AppMenu = { label: string; entries: MenuEntry[] };
+export type WorkPlane = "XY" | "XZ" | "YZ";
+type AxisName = "X" | "Y" | "Z";
+type PlaneDefinition = {
+  plane: WorkPlane;
+  gCode: "G17" | "G18" | "G19";
+  horizontalAxis: AxisName;
+  verticalAxis: AxisName;
+  normalAxis: AxisName;
+};
 type PostSettings = {
+  plane: WorkPlane;
   program: string;
   comment: string;
   safeZ: number;
@@ -121,8 +131,13 @@ type PostSettings = {
 };
 type PlotGeometry = { curve: Curve; segments: Segment[]; points: Point[]; paths?: Point[][]; error?: string };
 
-const VERSION = "1.4.1";
+const VERSION = "1.5.0";
 const COLORS = ["#ff8a1d", "#47c8ff", "#c985ff", "#73e0aa", "#f15b74", "#ffd166"];
+export const PLANE_DEFINITIONS: Record<WorkPlane, PlaneDefinition> = {
+  XY: { plane: "XY", gCode: "G17", horizontalAxis: "X", verticalAxis: "Y", normalAxis: "Z" },
+  XZ: { plane: "XZ", gCode: "G18", horizontalAxis: "X", verticalAxis: "Z", normalAxis: "Y" },
+  YZ: { plane: "YZ", gCode: "G19", horizontalAxis: "Y", verticalAxis: "Z", normalAxis: "X" },
+};
 const DEFAULT_VIEW: View = { cx: 0, cy: 0, scale: 10 };
 const DEFAULT_PARAMS: Parameter[] = [
   { id: "p-a", name: "a", value: 1 },
@@ -166,6 +181,7 @@ const DEFAULT_CURVES: Curve[] = [
   },
 ];
 const DEFAULT_POST: PostSettings = {
+  plane: "XY",
   program: "0100",
   comment: "GT_CODE_PROFILE",
   safeZ: 15,
@@ -207,6 +223,48 @@ const PRESETS: Array<{ name: string; type: CurveType; expression: string; note: 
   { name: "Iperbole", type: "function", expression: "y = 120/x", note: "y = k/x" },
   { name: "Spirale", type: "parametric", expression: "x=(2+0.35*t)*cos(t); y=(2+0.35*t)*sin(t)", note: "x(t); y(t)" },
 ];
+
+export function normalizeWorkPlane(value: unknown): WorkPlane {
+  return value === "XZ" || value === "YZ" ? value : "XY";
+}
+
+export function remapPlaneExpression(expression: string, fromPlane: WorkPlane, toPlane: WorkPlane) {
+  if (fromPlane === toPlane) return expression;
+  const from = PLANE_DEFINITIONS[fromPlane];
+  const to = PLANE_DEFINITIONS[toPlane];
+  const horizontal = from.horizontalAxis.toLowerCase();
+  const vertical = from.verticalAxis.toLowerCase();
+  return expression.replace(/\b[a-zA-Z_][a-zA-Z0-9_]*\b/g, (token) => {
+    if (token === horizontal) return to.horizontalAxis.toLowerCase();
+    if (token === vertical) return to.verticalAxis.toLowerCase();
+    return token;
+  });
+}
+
+function remapPlaneLabels(text: string, fromPlane: WorkPlane, toPlane: WorkPlane) {
+  if (fromPlane === toPlane) return text;
+  const from = PLANE_DEFINITIONS[fromPlane];
+  const to = PLANE_DEFINITIONS[toPlane];
+  return text.replace(/\b[XYZ]\b/g, (axis) => {
+    if (axis === from.horizontalAxis) return to.horizontalAxis;
+    if (axis === from.verticalAxis) return to.verticalAxis;
+    return axis;
+  });
+}
+
+export function planePointToMachineCoordinates(point: Point, plane: WorkPlane, normal = 0): Record<AxisName, number> {
+  const definition = PLANE_DEFINITIONS[plane];
+  return {
+    X: definition.horizontalAxis === "X" ? point.x : definition.verticalAxis === "X" ? point.y : normal,
+    Y: definition.horizontalAxis === "Y" ? point.x : definition.verticalAxis === "Y" ? point.y : normal,
+    Z: definition.horizontalAxis === "Z" ? point.x : definition.verticalAxis === "Z" ? point.y : normal,
+  };
+}
+
+function formatPlanePoint(point: Point, plane: WorkPlane, decimals = 6, separator = " · ") {
+  const definition = PLANE_DEFINITIONS[plane];
+  return `${definition.horizontalAxis} ${fmt(point.x, decimals)}${separator}${definition.verticalAxis} ${fmt(point.y, decimals)}`;
+}
 
 const FUNCTION_NAMES = new Set([
   "sin",
@@ -283,9 +341,9 @@ function validateNode(expression: string, variables: Set<string>) {
   return node;
 }
 
-function compileCurve(curve: Curve, params: Record<string, number>) {
+function compileCurve(curve: Curve, params: Record<string, number>, plane: WorkPlane = "XY") {
   const variables = new Set(["x", "y", "t", ...Object.keys(params)]);
-  const normalized = normalizeExpression(curve.expression);
+  const normalized = normalizeExpression(remapPlaneExpression(curve.expression, plane, "XY"));
   if (curve.type === "function") {
     const body = normalized.replace(/^\s*(?:f\s*\(\s*x\s*\)|y)\s*=\s*/i, "");
     validateNode(body, variables);
@@ -327,10 +385,10 @@ function geometryFromPaths(curve: Curve, rawPaths: Point[][]): PlotGeometry {
   return { curve, paths, segments, points: paths.flat() };
 }
 
-function sampledGeometry(curve: Curve, params: Record<string, number>, bounds?: { xMin: number; xMax: number; yMin: number; yMax: number }): PlotGeometry {
+function sampledGeometry(curve: Curve, params: Record<string, number>, bounds?: { xMin: number; xMax: number; yMin: number; yMax: number }, plane: WorkPlane = "XY"): PlotGeometry {
   try {
     if (curve.trimmedPaths?.length) return geometryFromPaths(curve, curve.trimmedPaths);
-    const compiled = compileCurve(curve, params);
+    const compiled = compileCurve(curve, params, plane);
     const segments: Segment[] = [];
     const points: Point[] = [];
     const xMin = bounds ? Math.max(curve.domainMin, bounds.xMin) : curve.domainMin;
@@ -587,9 +645,9 @@ function constructionPoint(values: ConstructionValues, field: PointField): Point
   return finitePoint({ x, y }) ? { x, y } : null;
 }
 
-function coordinatePair(values: ConstructionValues, field: PointField) {
+function coordinatePair(values: ConstructionValues, field: PointField, plane: WorkPlane = "XY") {
   const point = constructionPoint(values, field);
-  return point ? `${fmt(point.x, 5)}, ${fmt(point.y, 5)}` : "—, —";
+  return point ? formatPlanePoint(point, plane, 5) : "—, —";
 }
 
 export function resolveConstructionGeometry(
@@ -827,7 +885,7 @@ function signedTerm(value: number, variable = "") {
   return `${sign} ${preciseNumber(Math.abs(value))}${variable}`;
 }
 
-export function analyticEquationForEntity(entity: DrawEntity): { type: CurveType; expression: string; title: string } | null {
+export function analyticEquationForEntity(entity: DrawEntity, plane: WorkPlane = "XY"): { type: CurveType; expression: string; title: string } | null {
   if (entity.type === "line") {
     const a = entity.a.y - entity.b.y;
     const b = entity.b.x - entity.a.x;
@@ -839,7 +897,7 @@ export function analyticEquationForEntity(entity: DrawEntity): { type: CurveType
     const nc = c / norm;
     return {
       type: "implicit",
-      expression: `${preciseNumber(na)}*x ${signedTerm(nb, "*y")} ${signedTerm(nc)} = 0`,
+      expression: remapPlaneExpression(`${preciseNumber(na)}*x ${signedTerm(nb, "*y")} ${signedTerm(nc)} = 0`, "XY", plane),
       title: "Retta da geometria",
     };
   }
@@ -848,22 +906,23 @@ export function analyticEquationForEntity(entity: DrawEntity): { type: CurveType
     const yShift = entity.c.y < 0 ? `+ ${preciseNumber(Math.abs(entity.c.y))}` : `- ${preciseNumber(entity.c.y)}`;
     return {
       type: "implicit",
-      expression: `(x ${xShift})^2 + (y ${yShift})^2 = ${preciseNumber(entity.r)}^2`,
+      expression: remapPlaneExpression(`(x ${xShift})^2 + (y ${yShift})^2 = ${preciseNumber(entity.r)}^2`, "XY", plane),
       title: "Circonferenza da geometria",
     };
   }
   return null;
 }
 
-function drawEntityInquiryDetails(entity: DrawEntity) {
-  if (entity.type === "point") return `Punto X=${fmt(entity.p.x, 6)} Y=${fmt(entity.p.y, 6)}`;
+function drawEntityInquiryDetails(entity: DrawEntity, plane: WorkPlane = "XY") {
+  const definition = PLANE_DEFINITIONS[plane];
+  if (entity.type === "point") return `Punto ${definition.horizontalAxis}=${fmt(entity.p.x, 6)} ${definition.verticalAxis}=${fmt(entity.p.y, 6)}`;
   if (entity.type === "line") {
     const length = distance(entity.a, entity.b);
     const angle = Math.atan2(entity.b.y - entity.a.y, entity.b.x - entity.a.x) * 180 / Math.PI;
-    const equation = analyticEquationForEntity(entity)?.expression ?? "—";
+    const equation = analyticEquationForEntity(entity, plane)?.expression ?? "—";
     return `L=${fmt(length, 6)}; angolo=${fmt(angle, 4)} deg; ${equation}`;
   }
-  if (entity.type === "circle") return `C=(${fmt(entity.c.x, 6)}, ${fmt(entity.c.y, 6)}); R=${fmt(entity.r, 6)}; D=${fmt(entity.r * 2, 6)}`;
+  if (entity.type === "circle") return `C=(${definition.horizontalAxis}=${fmt(entity.c.x, 6)}, ${definition.verticalAxis}=${fmt(entity.c.y, 6)}); R=${fmt(entity.r, 6)}; D=${fmt(entity.r * 2, 6)}`;
   return `Polilinea; vertici=${entity.points.length}; lunghezza=${fmt(pathLength(entity.points), 6)}`;
 }
 
@@ -890,24 +949,26 @@ export function formatInquiryReport(
   intersections: Intersection[],
   curveLabel: (id: string) => string = (id) => id,
   generatedAt = new Date(),
+  plane: WorkPlane = "XY",
 ) {
+  const definition = PLANE_DEFINITIONS[plane];
   const lines = [
     `GT.CODE ANALYTIC CAD V${VERSION}`,
     "REPORT PUNTI INTERROGATI E INTERSEZIONI",
     `DATA: ${generatedAt.toLocaleString("it-IT")}`,
-    "UNITA: mm  |  PIANO: XY",
+    `UNITA: mm  |  PIANO: ${plane} (${definition.gCode})  |  ASSE NORMALE: ${definition.normalAxis}`,
     "",
     `[PUNTI INTERROGATI: ${inquiryPoints.length}]`,
   ];
   if (!inquiryPoints.length) lines.push("Nessun punto interrogato.");
   inquiryPoints.forEach((item) => {
-    lines.push(`${item.name} | ${INQUIRY_KIND_LABELS[item.kind]} | X=${fmt(item.point.x, 8)} | Y=${fmt(item.point.y, 8)} | ${item.source}`);
+    lines.push(`${item.name} | ${INQUIRY_KIND_LABELS[item.kind]} | ${definition.horizontalAxis}=${fmt(item.point.x, 8)} | ${definition.verticalAxis}=${fmt(item.point.y, 8)} | ${item.source}`);
     if (item.details) lines.push(`  DETTAGLI: ${item.details}`);
     if (item.equation) lines.push(`  EQUAZIONE: ${item.equation}`);
   });
   lines.push("", `[INTERSEZIONI CALCOLATE: ${intersections.length}]`);
   if (!intersections.length) lines.push("Nessuna intersezione calcolata.");
-  intersections.forEach((item, index) => lines.push(`IX${index + 1} | X=${fmt(item.x, 8)} | Y=${fmt(item.y, 8)} | ${curveLabel(item.curves[0])} x ${curveLabel(item.curves[1])}`));
+  intersections.forEach((item, index) => lines.push(`IX${index + 1} | ${definition.horizontalAxis}=${fmt(item.x, 8)} | ${definition.verticalAxis}=${fmt(item.y, 8)} | ${curveLabel(item.curves[0])} x ${curveLabel(item.curves[1])}`));
   lines.push("", "FINE REPORT", "Verificare sempre tolleranze, unita e origine prima dell'uso CNC.");
   return lines.join("\n");
 }
@@ -1053,10 +1114,14 @@ function sanitizeProgram(value: string) {
   return digits.padStart(4, "0");
 }
 
-function generateGCode(points: Point[], settings: PostSettings) {
+export function generateGCode(points: Point[], settings: PostSettings) {
   if (points.length < 2) return "(AGGIUNGERE ALMENO 2 PUNTI AL PERCORSO)";
-  const d = settings.decimals;
+  if (points.some((point) => !finitePoint(point))) return "(ERRORE: IL PERCORSO CONTIENE COORDINATE NON VALIDE)";
+  const plane = normalizeWorkPlane(settings.plane);
+  const definition = PLANE_DEFINITIONS[plane];
+  const d = Math.max(0, Math.min(6, Math.trunc(settings.decimals)));
   const coord = (axis: string, value: number) => `${axis}${value.toFixed(d)}`;
+  const planeCoordinates = (point: Point) => `${coord(definition.horizontalAxis, point.x)} ${coord(definition.verticalAxis, point.y)}`;
   const normalized = settings.closePath && distance(points[0], points[points.length - 1]) > Math.pow(10, -d)
     ? [...points, points[0]]
     : points;
@@ -1064,22 +1129,24 @@ function generateGCode(points: Point[], settings: PostSettings) {
     "%",
     `O${sanitizeProgram(settings.program)} (${settings.comment.toUpperCase().replace(/[^A-Z0-9_. -]/g, "_").slice(0, 28)})`,
     `(GT.CODE ANALYTIC CAD V${VERSION})`,
+    `(PIANO ${plane} ${definition.gCode} - PROFILO ${definition.horizontalAxis}${definition.verticalAxis} - NORMALE ${definition.normalAxis})`,
+    `(${definition.gCode} NON ORIENTA LA TESTA - VERIFICARE ASSE UTENSILE ${definition.normalAxis})`,
     `(PUNTI ${normalized.length} - VERIFICARE IL PERCORSO PRIMA DELL'USO)`,
-    "G21 G17 G90 G40 G49 G80",
+    `G21 ${definition.gCode} G90 G40 G49 G80`,
     settings.workOffset,
     `T${Math.max(1, Math.trunc(settings.tool))} M6`,
     `S${Math.max(0, Math.trunc(settings.spindle))} M3`,
-    `G0 ${coord("Z", settings.safeZ)}`,
-    `G0 ${coord("X", normalized[0].x)} ${coord("Y", normalized[0].y)}`,
+    `G0 ${coord(definition.normalAxis, settings.safeZ)}`,
+    `G0 ${planeCoordinates(normalized[0])}`,
   ];
   if (settings.coolant) lines.push("M8");
-  lines.push(`G1 ${coord("Z", settings.workZ)} F${Math.max(1, Math.round(settings.feedZ))}`);
+  lines.push(`G1 ${coord(definition.normalAxis, settings.workZ)} F${Math.max(1, Math.round(settings.feedZ))}`);
   for (let i = 1; i < normalized.length; i += 1) {
-    lines.push(`G1 ${coord("X", normalized[i].x)} ${coord("Y", normalized[i].y)}${i === 1 ? ` F${Math.max(1, Math.round(settings.feedXY))}` : ""}`);
+    lines.push(`G1 ${planeCoordinates(normalized[i])}${i === 1 ? ` F${Math.max(1, Math.round(settings.feedXY))}` : ""}`);
   }
-  lines.push(`G0 ${coord("Z", settings.safeZ)}`);
+  lines.push(`G0 ${coord(definition.normalAxis, settings.safeZ)}`);
   if (settings.coolant) lines.push("M9");
-  lines.push("M5", "G0 X0.000 Y0.000", "M30", "%");
+  lines.push("M5", `G0 ${coord(definition.horizontalAxis, 0)} ${coord(definition.verticalAxis, 0)}`, "M30", "%");
   return lines.join("\n");
 }
 
@@ -1255,6 +1322,8 @@ export default function AnalyticCad() {
   const [canUndo, setCanUndo] = useState(false);
   const [canRedo, setCanRedo] = useState(false);
 
+  const workPlane = normalizeWorkPlane(post.plane);
+  const planeDefinition = PLANE_DEFINITIONS[workPlane];
   const paramScope = useMemo(() => Object.fromEntries(params.map((parameter) => [parameter.name, parameter.value])), [params]);
   const bounds = useMemo(() => ({
     xMin: view.cx - canvasSize.width / view.scale / 2,
@@ -1263,8 +1332,8 @@ export default function AnalyticCad() {
     yMax: view.cy + canvasSize.height / view.scale / 2,
   }), [view, canvasSize]);
   const plotGeometries = useMemo(
-    () => curves.filter((curve) => curve.visible).map((curve) => sampledGeometry(curve, paramScope, bounds)),
-    [curves, paramScope, bounds],
+    () => curves.filter((curve) => curve.visible).map((curve) => sampledGeometry(curve, paramScope, bounds, workPlane)),
+    [curves, paramScope, bounds, workPlane],
   );
   const selectedCurve = curves.find((curve) => curve.id === selectedCurveId) ?? null;
   const selectedDrawEntity = drawEntities.find((entity) => entity.id === selectedEntityId) ?? null;
@@ -1332,7 +1401,7 @@ export default function AnalyticCad() {
           setIntersections(project.intersections ?? []);
           setInquiryPoints(project.inquiryPoints ?? []);
           setInquiryLabelsVisible(project.inquiryLabelsVisible ?? true);
-          setPost({ ...DEFAULT_POST, ...(project.post ?? {}) });
+          setPost({ ...DEFAULT_POST, ...(project.post ?? {}), plane: normalizeWorkPlane(project.post?.plane) });
           setView(project.view ?? DEFAULT_VIEW);
           setStatus("Backup locale ripristinato");
         });
@@ -1351,12 +1420,12 @@ export default function AnalyticCad() {
   }, [curves, params, intersections, drawEntities, pathPoints, inquiryPoints, inquiryLabelsVisible, post, view]);
 
   const pushHistory = useCallback(() => {
-    historyRef.current.push(JSON.stringify({ curves, params, drawEntities, pathPoints, inquiryPoints }));
+    historyRef.current.push(JSON.stringify({ curves, params, drawEntities, pathPoints, inquiryPoints, post }));
     historyRef.current = historyRef.current.slice(-30);
     futureRef.current = [];
     setCanUndo(true);
     setCanRedo(false);
-  }, [curves, params, drawEntities, pathPoints, inquiryPoints]);
+  }, [curves, params, drawEntities, pathPoints, inquiryPoints, post]);
 
   const restoreSnapshot = (json: string) => {
     const snapshot = JSON.parse(json);
@@ -1365,6 +1434,7 @@ export default function AnalyticCad() {
     setDrawEntities(snapshot.drawEntities);
     setPathPoints(snapshot.pathPoints);
     setInquiryPoints(snapshot.inquiryPoints ?? []);
+    setPost({ ...DEFAULT_POST, ...(snapshot.post ?? {}), plane: normalizeWorkPlane(snapshot.post?.plane) });
     setIntersections([]);
     setSelectedIntersectionId(null);
     setSelectedInquiryId(null);
@@ -1379,7 +1449,7 @@ export default function AnalyticCad() {
   const undo = () => {
     const previous = historyRef.current.pop();
     if (!previous) return;
-    futureRef.current.push(JSON.stringify({ curves, params, drawEntities, pathPoints, inquiryPoints }));
+    futureRef.current.push(JSON.stringify({ curves, params, drawEntities, pathPoints, inquiryPoints, post }));
     restoreSnapshot(previous);
     setCanUndo(historyRef.current.length > 0);
     setCanRedo(true);
@@ -1388,7 +1458,7 @@ export default function AnalyticCad() {
   const redo = () => {
     const next = futureRef.current.pop();
     if (!next) return;
-    historyRef.current.push(JSON.stringify({ curves, params, drawEntities, pathPoints, inquiryPoints }));
+    historyRef.current.push(JSON.stringify({ curves, params, drawEntities, pathPoints, inquiryPoints, post }));
     restoreSnapshot(next);
     setCanUndo(true);
     setCanRedo(futureRef.current.length > 0);
@@ -1668,7 +1738,7 @@ export default function AnalyticCad() {
       point: contact.point,
       kind: "tangency" as const,
       source: `Circonferenza ↔ Retta ${contact.lineIndex + 1}`,
-      details: `C=(${fmt(circleHit!.entity.c.x, 6)}, ${fmt(circleHit!.entity.c.y, 6)}); R=${fmt(circleHit!.entity.r, 6)}; errore=${fmt(contact.error, 8)}`,
+      details: `C=(${planeDefinition.horizontalAxis}=${fmt(circleHit!.entity.c.x, 6)}, ${planeDefinition.verticalAxis}=${fmt(circleHit!.entity.c.y, 6)}); R=${fmt(circleHit!.entity.r, 6)}; errore=${fmt(contact.error, 8)}`,
     })));
     setStatus(`${contacts.length} tangenz${contacts.length === 1 ? "a" : "e"} trovate${additions.length ? ` · create ${additions.map((item) => item.name).join(", ")}` : " · punti già presenti nel report"}`);
   };
@@ -1685,7 +1755,7 @@ export default function AnalyticCad() {
         drawEntityIntersections(drawEntities[first], drawEntities[second]).forEach((point) => candidates.push({
           point,
           source: `Entità ${first + 1} × Entità ${second + 1}`,
-          details: `${drawEntityInquiryDetails(drawEntities[first])} | ${drawEntityInquiryDetails(drawEntities[second])}`,
+          details: `${drawEntityInquiryDetails(drawEntities[first], workPlane)} | ${drawEntityInquiryDetails(drawEntities[second], workPlane)}`,
         }));
       }
     }
@@ -1736,7 +1806,7 @@ export default function AnalyticCad() {
     }
     const additions = appendInquiryPoints([{ prefix: "I", point: nearest.candidate.point, kind: "intersection", source: nearest.candidate.source, details: nearest.candidate.details }]);
     if (nearest.candidate.intersectionId) setSelectedIntersectionId(nearest.candidate.intersectionId);
-    setStatus(additions.length ? `${additions[0].name} interrogata · X${fmt(additions[0].point.x, 6)} Y${fmt(additions[0].point.y, 6)}` : "Intersezione già presente nel report");
+    setStatus(additions.length ? `${additions[0].name} interrogata · ${formatPlanePoint(additions[0].point, workPlane)}` : "Intersezione già presente nel report");
   };
 
   const interrogatePoint = (world: Point, snap: SnapHit) => {
@@ -1745,9 +1815,9 @@ export default function AnalyticCad() {
       point: world,
       kind: "point",
       source: snap ? `Snap ${snap.kind}` : "Coordinate canvas",
-      details: snap ? `Punto acquisito con snap ${snap.kind}` : "Punto libero interrogato sul piano XY",
+      details: snap ? `Punto acquisito con snap ${snap.kind}` : `Punto libero interrogato sul piano ${workPlane}`,
     }]);
-    if (additions.length) setStatus(`${additions[0].name} · X${fmt(world.x, 6)} Y${fmt(world.y, 6)}`);
+    if (additions.length) setStatus(`${additions[0].name} · ${formatPlanePoint(world, workPlane)}`);
     else setStatus("Punto già presente nel report");
   };
 
@@ -1763,7 +1833,7 @@ export default function AnalyticCad() {
       setSelectedCurveId("");
       setInspection(null);
       const source = drawHit.entity.type === "line" ? "Retta disegnata" : drawHit.entity.type === "circle" ? "Circonferenza disegnata" : drawHit.entity.type === "polyline" ? "Profilo disegnato" : "Punto disegnato";
-      const additions = appendInquiryPoints([{ prefix: "Q", point: drawHit.point, kind: "curve", source, details: drawEntityInquiryDetails(drawHit.entity) }]);
+      const additions = appendInquiryPoints([{ prefix: "Q", point: drawHit.point, kind: "curve", source, details: drawEntityInquiryDetails(drawHit.entity, workPlane) }]);
       setStatus(additions.length ? `${additions[0].name} sulla ${source.toLowerCase()} · ${additions[0].details}` : "Punto della curva già presente nel report");
       return;
     }
@@ -1800,8 +1870,8 @@ export default function AnalyticCad() {
     }
     setSelectedEntityId(nearest.entity.id);
     setSelectedCurveId("");
-    const additions = appendInquiryPoints([{ prefix: "C", point: nearest.entity.c, kind: "center", source: "Centro circonferenza", details: drawEntityInquiryDetails(nearest.entity) }]);
-    setStatus(additions.length ? `${additions[0].name} · Centro X${fmt(nearest.entity.c.x, 6)} Y${fmt(nearest.entity.c.y, 6)}` : "Centro già presente nel report");
+    const additions = appendInquiryPoints([{ prefix: "C", point: nearest.entity.c, kind: "center", source: "Centro circonferenza", details: drawEntityInquiryDetails(nearest.entity, workPlane) }]);
+    setStatus(additions.length ? `${additions[0].name} · Centro ${formatPlanePoint(nearest.entity.c, workPlane)}` : "Centro già presente nel report");
   };
 
   const createAnalyticEquation = (world: Point) => {
@@ -1810,7 +1880,7 @@ export default function AnalyticCad() {
       setStatus("Crea equazione · tocca una retta o una circonferenza disegnata");
       return;
     }
-    const analytic = analyticEquationForEntity(hit.entity);
+    const analytic = analyticEquationForEntity(hit.entity, workPlane);
     if (!analytic) {
       setStatus("Questa entità non possiede una singola equazione analitica supportata");
       return;
@@ -1950,7 +2020,7 @@ export default function AnalyticCad() {
       yMin: Math.min(calcDomain.yMin, bounds.yMin),
       yMax: Math.max(calcDomain.yMax, bounds.yMax),
     };
-    const geometries = curves.filter((curve) => curve.visible).map((curve) => sampledGeometry(curve, paramScope, trimBounds));
+    const geometries = curves.filter((curve) => curve.visible).map((curve) => sampledGeometry(curve, paramScope, trimBounds, workPlane));
     let curveTarget: { geometry: PlotGeometry; hit: PathLocation } | null = null;
     for (const geometry of geometries) {
       const paths = geometry.paths ?? [];
@@ -2088,8 +2158,8 @@ export default function AnalyticCad() {
         ctx.fillText(fmt(y, 3), Math.min(w - 35, Math.max(5, origin.x + 5)), sy - 4);
       }
       ctx.fillStyle = "#ff922d"; ctx.font = "bold 15px Inter, sans-serif";
-      ctx.fillText("X", w - 18, Math.min(h - 8, Math.max(16, origin.y - 8)));
-      ctx.fillText("Y", Math.min(w - 18, Math.max(8, origin.x + 8)), 16);
+      ctx.fillText(planeDefinition.horizontalAxis, w - 18, Math.min(h - 8, Math.max(16, origin.y - 8)));
+      ctx.fillText(planeDefinition.verticalAxis, Math.min(w - 18, Math.max(8, origin.x + 8)), 16);
     }
     for (const geometry of plotGeometries) {
       if (!geometry.segments.length) continue;
@@ -2278,7 +2348,7 @@ export default function AnalyticCad() {
     if (measure) {
       const a = worldToScreen(measure.a); const b = worldToScreen(measure.b);
       ctx.save(); ctx.setLineDash([4, 4]); ctx.strokeStyle = "#64d3ff"; ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
-      const label = `L ${fmt(distance(measure.a, measure.b), 4)}  ΔX ${fmt(measure.b.x - measure.a.x, 4)}  ΔY ${fmt(measure.b.y - measure.a.y, 4)}`;
+      const label = `L ${fmt(distance(measure.a, measure.b), 4)}  Δ${planeDefinition.horizontalAxis} ${fmt(measure.b.x - measure.a.x, 4)}  Δ${planeDefinition.verticalAxis} ${fmt(measure.b.y - measure.a.y, 4)}`;
       const mx = (a.x + b.x) / 2; const my = (a.y + b.y) / 2;
       ctx.font = "15px ui-monospace, monospace"; const width = ctx.measureText(label).width + 12;
       ctx.fillStyle = "rgba(6,12,19,.9)"; ctx.fillRect(mx - width / 2, my - 27, width, 21);
@@ -2295,7 +2365,7 @@ export default function AnalyticCad() {
       }
       ctx.font = "bold 14px Inter, sans-serif"; ctx.fillText(snapHit.kind.toUpperCase(), p.x + 10, p.y - 10); ctx.restore();
     }
-  }, [canvasSize, view, bounds, gridVisible, axesVisible, plotGeometries, selectedCurveId, selectedEntityId, drawEntities, tangentConstraintIds, tangentSlotCount, constructionShell, constructionResult, constructionValues, lineMethod, circleMethod, pathPoints, post.closePath, intersections, selectedIntersectionId, inquiryPoints, selectedInquiryId, inquiryLabelsVisible, inspection, draftStart, draftCurrent, tool, measure, snapHit, worldToScreen]);
+  }, [canvasSize, view, bounds, gridVisible, axesVisible, plotGeometries, selectedCurveId, selectedEntityId, drawEntities, tangentConstraintIds, tangentSlotCount, constructionShell, constructionResult, constructionValues, lineMethod, circleMethod, pathPoints, post.closePath, intersections, selectedIntersectionId, inquiryPoints, selectedInquiryId, inquiryLabelsVisible, inspection, draftStart, draftCurrent, tool, measure, snapHit, worldToScreen, planeDefinition]);
 
   const canvasPoint = (event: ReactPointerEvent<HTMLCanvasElement>): Point => {
     const rect = event.currentTarget.getBoundingClientRect();
@@ -2404,13 +2474,13 @@ export default function AnalyticCad() {
         setSelectedCurveId("");
         setSelectedEntityId(null);
         setSelectedIntersectionId(null);
-        setStatus(`${queried.item.name} · ${INQUIRY_KIND_LABELS[queried.item.kind]} · X${fmt(queried.item.point.x, 6)} Y${fmt(queried.item.point.y, 6)} · ${queried.item.source}`);
+        setStatus(`${queried.item.name} · ${INQUIRY_KIND_LABELS[queried.item.kind]} · ${formatPlanePoint(queried.item.point, workPlane)} · ${queried.item.source}`);
         return;
       }
       setSelectedInquiryId(null);
       const ix = intersections.find((item) => distance(item, world) < 12 / view.scale);
       if (ix) {
-        setSelectedIntersectionId(ix.id); setInspection(null); setStatus(`Intersezione X${fmt(ix.x)} Y${fmt(ix.y)}`); return;
+        setSelectedIntersectionId(ix.id); setInspection(null); setStatus(`Intersezione ${formatPlanePoint(ix, workPlane)}`); return;
       }
       let nearest: { id: string; d: number; point: Point; segment: Segment } | null = null;
       for (const geometry of plotGeometries) {
@@ -2440,7 +2510,7 @@ export default function AnalyticCad() {
         setInspection(null);
         const type = nearestEntity.entity.type === "line" ? "Retta" : nearestEntity.entity.type === "circle" ? "Circonferenza" : nearestEntity.entity.type === "polyline" ? "Profilo tagliato" : "Punto";
         setStatus(nearestEntity.entity.type === "circle"
-          ? `Circonferenza interrogata · Centro X${fmt(nearestEntity.entity.c.x, 5)} Y${fmt(nearestEntity.entity.c.y, 5)} · R${fmt(nearestEntity.entity.r, 5)}`
+          ? `Circonferenza interrogata · Centro ${formatPlanePoint(nearestEntity.entity.c, workPlane, 5)} · R${fmt(nearestEntity.entity.r, 5)}`
           : type + " selezionata · usa il cestino o il tasto Canc");
       } else if (nearest) {
         const dx = nearest.segment.b.x - nearest.segment.a.x;
@@ -2450,13 +2520,13 @@ export default function AnalyticCad() {
         setSelectedCurveId(nearest.id);
         setSelectedEntityId(null);
         setInspection({ curveId: nearest.id, point: nearest.point, angle, slope });
-        setStatus(`Punto interrogato X${fmt(nearest.point.x, 5)} Y${fmt(nearest.point.y, 5)} · tangente ${fmt(angle * 180 / Math.PI, 3)}°`);
+        setStatus(`Punto interrogato ${formatPlanePoint(nearest.point, workPlane, 5)} · tangente ${fmt(angle * 180 / Math.PI, 3)}°`);
       } else {
         setSelectedCurveId("");
         setSelectedEntityId(null);
         setSelectedIntersectionId(null);
         setInspection(null);
-        setStatus(`Punto X${fmt(world.x)} Y${fmt(world.y)}`);
+        setStatus(`Punto ${formatPlanePoint(world, workPlane)}`);
       }
       return;
     }
@@ -2544,7 +2614,7 @@ export default function AnalyticCad() {
     pushHistory();
     const curve: Curve = {
       id: uid("curve"), name: preset?.name ?? `Curva ${curves.length + 1}`, type: preset?.type ?? "function",
-      expression: preset?.expression ?? "y = x", color: COLORS[curves.length % COLORS.length], visible: true,
+      expression: remapPlaneExpression(preset?.expression ?? "y = x", "XY", workPlane), color: COLORS[curves.length % COLORS.length], visible: true,
       domainMin: preset?.type === "parametric" ? 0 : calcDomain.xMin,
       domainMax: preset?.type === "parametric" ? Math.PI * 8 : calcDomain.xMax,
       samples: preset?.type === "implicit" ? 120 : 900,
@@ -2581,6 +2651,27 @@ export default function AnalyticCad() {
     setTolerance(value);
     setIntersections([]);
     setSelectedIntersectionId(null);
+  };
+
+  const changeWorkPlane = (nextPlane: WorkPlane) => {
+    const next = normalizeWorkPlane(nextPlane);
+    if (next === workPlane) return;
+    pushHistory();
+    setCurves((current) => current.map((curve) => ({
+      ...curve,
+      expression: remapPlaneExpression(curve.expression, workPlane, next),
+    })));
+    setInquiryPoints((current) => current.map((item) => ({
+      ...item,
+      details: remapPlaneExpression(remapPlaneLabels(item.details, workPlane, next), workPlane, next),
+      equation: item.equation ? remapPlaneExpression(item.equation, workPlane, next) : undefined,
+    })));
+    setPost((current) => ({ ...current, plane: next }));
+    setIntersections([]);
+    setSelectedIntersectionId(null);
+    setInspection(null);
+    const definition = PLANE_DEFINITIONS[next];
+    setStatus(`Piano ${next} · ${definition.gCode} · profilo ${definition.horizontalAxis}/${definition.verticalAxis} · asse normale ${definition.normalAxis}`);
   };
 
   const deleteCurve = (id: string) => {
@@ -2672,7 +2763,7 @@ export default function AnalyticCad() {
   const runIntersections = () => {
     setStatus("Calcolo intersezioni…");
     requestAnimationFrame(() => {
-      const geometries = curves.filter((curve) => curve.visible).map((curve) => sampledGeometry(curve, paramScope, calcDomain));
+      const geometries = curves.filter((curve) => curve.visible).map((curve) => sampledGeometry(curve, paramScope, calcDomain, workPlane));
       const errors = geometries.filter((geometry) => geometry.error);
       if (errors.length) {
         setStatus(`${errors[0].curve.name}: ${errors[0].error}`); return;
@@ -2752,7 +2843,7 @@ export default function AnalyticCad() {
       pushHistory(); setCurves(project.curves); setParams(project.params ?? DEFAULT_PARAMS); setIntersections(project.intersections ?? []);
       setDrawEntities(project.drawEntities ?? []); setPathPoints(project.pathPoints ?? []); setView(project.view ?? DEFAULT_VIEW);
       setInquiryPoints(project.inquiryPoints ?? []); setInquiryLabelsVisible(project.inquiryLabelsVisible ?? true); setSelectedInquiryId(null); setInquiryMode(null);
-      setPost({ ...DEFAULT_POST, ...(project.post ?? {}) }); setTolerance(project.tolerance ?? 0.01); setCalcDomain(project.calcDomain ?? calcDomain);
+      setPost({ ...DEFAULT_POST, ...(project.post ?? {}), plane: normalizeWorkPlane(project.post?.plane) }); setTolerance(project.tolerance ?? 0.01); setCalcDomain(project.calcDomain ?? calcDomain);
       setSelectedCurveId(project.curves[0]?.id ?? ""); setSelectedEntityId(null); setTangentLineId(null);
       setTangentConstraintIds([null, null, null, null]); setTangentPickTarget(null); setSolutionPickMode(false);
       setConstructionShellMinimized(false); setStatus(`${file.name} aperto`);
@@ -2762,7 +2853,7 @@ export default function AnalyticCad() {
   };
 
   const saveInquiryReport = async () => {
-    const report = formatInquiryReport(inquiryPoints, intersections, (id) => curves.find((curve) => curve.id === id)?.name ?? id);
+    const report = formatInquiryReport(inquiryPoints, intersections, (id) => curves.find((curve) => curve.id === id)?.name ?? id, new Date(), workPlane);
     const blob = new Blob([report], { type: "text/plain;charset=utf-8" });
     const result = await saveFile(blob, `GT_CODE_REPORT_INTERSEZIONI_${new Date().toISOString().slice(0, 10)}.txt`, "Report punti interrogati e intersezioni GT.Code");
     setStatus(`${result} · report TXT con ${inquiryPoints.length} punti interrogati e ${intersections.length} intersezioni`);
@@ -2789,7 +2880,8 @@ export default function AnalyticCad() {
 
   const curveName = (id: string) => curves.find((curve) => curve.id === id)?.name ?? "Curva";
   const drawEntityName = (entity: DrawEntity) => entity.type === "line" ? "Retta disegnata" : entity.type === "circle" ? "Circonferenza disegnata" : entity.type === "polyline" ? (entity.source ?? "Profilo tagliato") : "Punto disegnato";
-  const selectedCurveError = selectedCurve ? sampledGeometry(selectedCurve, paramScope, calcDomain).error : undefined;
+  const selectedCurveError = selectedCurve ? sampledGeometry(selectedCurve, paramScope, calcDomain, workPlane).error : undefined;
+  const cursorMachine = planePointToMachineCoordinates(cursorWorld, workPlane, post.workZ);
   const constructionAcquisitionText = constructionPickTarget
     ? `Tocca il punto ${constructionPickTarget === "center" ? "centro" : constructionPickTarget.toUpperCase()} sul disegno`
     : tangentPickTarget !== null
@@ -2832,6 +2924,12 @@ export default function AnalyticCad() {
       { label: "Nuova formula…", action: () => setShowPresets(true) },
       { label: "Calcola intersezioni", action: runIntersections },
       { label: "Parametri globali", action: () => { setLeftCollapsed(false); setMobilePanel("formulas"); } },
+    ] },
+    { label: "Piano", entries: [
+      { label: "XY · G17 · normale Z", action: () => changeWorkPlane("XY"), checked: workPlane === "XY" },
+      { label: "XZ · G18 · normale Y", action: () => changeWorkPlane("XZ"), checked: workPlane === "XZ" },
+      { label: "YZ · G19 · normale X", action: () => changeWorkPlane("YZ"), checked: workPlane === "YZ" },
+      { label: "Configura quote e avanzamenti…", action: () => setShowGCode(true), separator: true },
     ] },
     { label: "Vista", entries: [
       { label: "Adatta alla finestra", action: () => fitView() },
@@ -2904,7 +3002,7 @@ export default function AnalyticCad() {
                   <button type="button" className={`visibility-dot ${curve.visible ? "visible" : ""}`} style={{ "--curve-color": curve.color } as React.CSSProperties} aria-label={curve.visible ? "Nascondi curva" : "Mostra curva"} onClick={(event) => { event.stopPropagation(); updateCurve(curve.id, { visible: !curve.visible }); }} />
                   <input className="curve-name" aria-label={`Nome curva ${index + 1}`} value={curve.name} onChange={(event) => updateCurve(curve.id, { name: event.target.value })} />
                   <select className="type-select" aria-label="Tipo curva" value={curve.type} onChange={(event) => updateCurve(curve.id, { type: event.target.value as CurveType })}>
-                    <option value="function">y=f(x)</option><option value="implicit">F(x,y)=0</option><option value="parametric">x(t); y(t)</option>
+                    <option value="function">{planeDefinition.verticalAxis.toLowerCase()}=f({planeDefinition.horizontalAxis.toLowerCase()})</option><option value="implicit">F({planeDefinition.horizontalAxis.toLowerCase()},{planeDefinition.verticalAxis.toLowerCase()})=0</option><option value="parametric">{planeDefinition.horizontalAxis.toLowerCase()}(t); {planeDefinition.verticalAxis.toLowerCase()}(t)</option>
                   </select>
                   <button type="button" className="mini-icon danger" aria-label="Elimina curva" onClick={(event) => { event.stopPropagation(); deleteCurve(curve.id); }}><Trash2 size={14} /></button>
                 </div>
@@ -2914,8 +3012,8 @@ export default function AnalyticCad() {
                   {error ? <span className="formula-status error" title={error}>!</span> : curve.visible ? <span className="formula-status ok"><Check size={11} /></span> : null}
                 </div>
                 {isSelected && <div className="curve-details">
-                  <NumberField label={curve.type === "parametric" ? "t min" : "X min"} value={curve.domainMin} onChange={(value) => updateCurve(curve.id, { domainMin: value })} />
-                  <NumberField label={curve.type === "parametric" ? "t max" : "X max"} value={curve.domainMax} onChange={(value) => updateCurve(curve.id, { domainMax: value })} />
+                  <NumberField label={curve.type === "parametric" ? "t min" : `${planeDefinition.horizontalAxis} min`} value={curve.domainMin} onChange={(value) => updateCurve(curve.id, { domainMin: value })} />
+                  <NumberField label={curve.type === "parametric" ? "t max" : `${planeDefinition.horizontalAxis} max`} value={curve.domainMax} onChange={(value) => updateCurve(curve.id, { domainMax: value })} />
                 </div>}
                 {curve.trimmedPaths && <div className="trimmed-state"><span><Scissors size={13} /> Profilo tagliato</span><button type="button" onClick={(event) => { event.stopPropagation(); restoreTrimmedCurve(curve.id); }}><RotateCcw size={12} /> Ripristina</button></div>}
                 {error && isSelected && <p className="inline-error">{error}</p>}
@@ -2940,10 +3038,10 @@ export default function AnalyticCad() {
           <div className="calculation-box">
             <div className="section-title"><Crosshair size={15} /> Ricerca intersezioni</div>
             <div className="domain-grid">
-              <NumberField label="X min" value={calcDomain.xMin} onChange={(value) => changeCalcDomain({ xMin: value })} />
-              <NumberField label="X max" value={calcDomain.xMax} onChange={(value) => changeCalcDomain({ xMax: value })} />
-              <NumberField label="Y min" value={calcDomain.yMin} onChange={(value) => changeCalcDomain({ yMin: value })} />
-              <NumberField label="Y max" value={calcDomain.yMax} onChange={(value) => changeCalcDomain({ yMax: value })} />
+              <NumberField label={`${planeDefinition.horizontalAxis} min`} value={calcDomain.xMin} onChange={(value) => changeCalcDomain({ xMin: value })} />
+              <NumberField label={`${planeDefinition.horizontalAxis} max`} value={calcDomain.xMax} onChange={(value) => changeCalcDomain({ xMax: value })} />
+              <NumberField label={`${planeDefinition.verticalAxis} min`} value={calcDomain.yMin} onChange={(value) => changeCalcDomain({ yMin: value })} />
+              <NumberField label={`${planeDefinition.verticalAxis} max`} value={calcDomain.yMax} onChange={(value) => changeCalcDomain({ yMax: value })} />
             </div>
             <NumberField label="Tolleranza" value={tolerance} min={0.000001} step="0.001" suffix="mm" onChange={changeTolerance} />
             <button type="button" className="primary-button full" onClick={runIntersections}><Sparkles size={16} /> Calcola intersezioni</button>
@@ -2961,6 +3059,7 @@ export default function AnalyticCad() {
         </div>
         {constructionShell && <ConstructionShell
           kind={constructionShell}
+          plane={workPlane}
           lineMethod={lineMethod}
           setLineMethod={setLineMethod}
           circleMethod={circleMethod}
@@ -3013,10 +3112,10 @@ export default function AnalyticCad() {
           onContextMenu={(event) => event.preventDefault()}
         />
         {inquiryMode && <div className="inquiry-mode-banner"><Target size={17} /><span><b>{INQUIRY_MODE_LABELS[inquiryMode]}</b><small>Tocca il disegno · punti salvati: {inquiryPoints.length}</small></span><button type="button" onClick={() => { setInquiryMode(null); setStatus("Modalità interrogazione terminata"); }} aria-label="Termina interrogazione"><X size={16} /></button></div>}
-        <div className="view-badge"><span>{fmt(1 / view.scale * 100, 3)} u / 100 px</span><b>XY</b></div>
-        <div className="orientation-widget"><span className="y-axis">Y</span><span className="x-axis">X</span><i /></div>
+        <div className="view-badge"><span>{fmt(1 / view.scale * 100, 3)} u / 100 px</span><b>{workPlane} · {planeDefinition.gCode}</b></div>
+        <div className="orientation-widget"><span className="y-axis">{planeDefinition.verticalAxis}</span><span className="x-axis">{planeDefinition.horizontalAxis}</span><i /></div>
         {(selectedCurve || selectedDrawEntity || selectedInquiryPoint) && <div className="selection-float">
-          <span style={{ background: selectedCurve?.color ?? (selectedInquiryPoint ? "#64d3ff" : "#ffad4d") }} /><div><small>{selectedInquiryPoint ? "PUNTO INTERROGATO" : "SELEZIONE"}</small><b>{selectedInquiryPoint ? selectedInquiryPoint.name : selectedCurve ? selectedCurve.name : selectedDrawEntity ? drawEntityName(selectedDrawEntity) : ""}</b>{selectedInquiryPoint && <em>X {fmt(selectedInquiryPoint.point.x, 4)} · Y {fmt(selectedInquiryPoint.point.y, 4)}</em>}{selectedDrawEntity?.type === "circle" && <em>C {fmt(selectedDrawEntity.c.x, 3)}, {fmt(selectedDrawEntity.c.y, 3)} · R {fmt(selectedDrawEntity.r, 3)}</em>}</div>
+          <span style={{ background: selectedCurve?.color ?? (selectedInquiryPoint ? "#64d3ff" : "#ffad4d") }} /><div><small>{selectedInquiryPoint ? "PUNTO INTERROGATO" : "SELEZIONE"}</small><b>{selectedInquiryPoint ? selectedInquiryPoint.name : selectedCurve ? selectedCurve.name : selectedDrawEntity ? drawEntityName(selectedDrawEntity) : ""}</b>{selectedInquiryPoint && <em>{formatPlanePoint(selectedInquiryPoint.point, workPlane, 4)}</em>}{selectedDrawEntity?.type === "circle" && <em>C {formatPlanePoint(selectedDrawEntity.c, workPlane, 3)} · R {fmt(selectedDrawEntity.r, 3)}</em>}</div>
           {selectedCurve && <button type="button" onClick={addCurveToPath}>Crea percorso</button>}
           {selectedDrawEntity && selectedDrawEntity.type !== "point" && <button type="button" onClick={addDrawEntityToPath}>Crea percorso</button>}
           {selectedInquiryPoint && <button type="button" onClick={() => renameInquiryPoint(selectedInquiryPoint.id)}>Rinomina</button>}
@@ -3039,7 +3138,7 @@ export default function AnalyticCad() {
             {!intersections.length ? <div className="empty-state"><Crosshair size={30} /><strong>Nessun risultato</strong><p>Imposta il dominio e calcola le intersezioni tra almeno due curve visibili.</p></div> : intersections.map((item, index) => <article key={item.id} className={`result-card ${selectedIntersectionId === item.id ? "selected" : ""}`}>
               <button type="button" className="result-main" onClick={() => focusPoint(item, item.id)}>
                 <span className="point-index">IX{index + 1}</span>
-                <span className="coordinates"><b>X {fmt(item.x, 6)}</b><b>Y {fmt(item.y, 6)}</b><small>{curveName(item.curves[0])} × {curveName(item.curves[1])}</small></span>
+                <span className="coordinates"><b>{planeDefinition.horizontalAxis} {fmt(item.x, 6)}</b><b>{planeDefinition.verticalAxis} {fmt(item.y, 6)}</b><small>{curveName(item.curves[0])} × {curveName(item.curves[1])}</small></span>
                 <Focus size={16} />
               </button>
               <button type="button" className="add-path-button" onClick={() => addPointToPath(item)}><Plus size={14} /> Percorso</button>
@@ -3049,7 +3148,7 @@ export default function AnalyticCad() {
             <header><div><Target size={15} /><span>Punti interrogati</span></div><button type="button" disabled={!inquiryPoints.length && !intersections.length} onClick={saveInquiryReport}><FileDown size={14} /> Report .TXT</button></header>
             {!inquiryPoints.length ? <p>Nessun punto nominato. Usa il menu <b>Interroga</b> e tocca il canvas.</p> : <div className="inquiry-list">{inquiryPoints.map((item) => <article key={item.id} className={selectedInquiryId === item.id ? "selected" : ""}>
               <button type="button" className="inquiry-focus" onClick={() => { focusPoint(item.point); setSelectedInquiryId(item.id); }}>
-                <span className="inquiry-name">{item.name}</span><span><b>{INQUIRY_KIND_LABELS[item.kind]}</b><small>X {fmt(item.point.x, 6)} · Y {fmt(item.point.y, 6)}</small><em>{item.source}</em></span><Focus size={15} />
+                <span className="inquiry-name">{item.name}</span><span><b>{INQUIRY_KIND_LABELS[item.kind]}</b><small>{formatPlanePoint(item.point, workPlane, 6)}</small><em>{item.source}</em></span><Focus size={15} />
               </button>
               <div className="inquiry-actions"><button type="button" onClick={() => renameInquiryPoint(item.id)}><PencilRuler size={13} /> Rinomina</button><button type="button" onClick={() => deleteInquiryPoint(item.id)}><Trash2 size={13} /> Elimina</button></div>
             </article>)}</div>}
@@ -3057,13 +3156,13 @@ export default function AnalyticCad() {
           <div className="inspector-block">
             <div className="section-title"><Info size={15} /> Proprietà selezione</div>
             {selectedInquiryPoint ? <>
-              <dl><div><dt>Nome</dt><dd>{selectedInquiryPoint.name}</dd></div><div><dt>Tipo</dt><dd>{INQUIRY_KIND_LABELS[selectedInquiryPoint.kind]}</dd></div><div><dt>X</dt><dd>{fmt(selectedInquiryPoint.point.x, 8)}</dd></div><div><dt>Y</dt><dd>{fmt(selectedInquiryPoint.point.y, 8)}</dd></div><div><dt>Origine</dt><dd>{selectedInquiryPoint.source}</dd></div>{selectedInquiryPoint.equation && <div><dt>Equazione</dt><dd>{selectedInquiryPoint.equation}</dd></div>}</dl>
+              <dl><div><dt>Nome</dt><dd>{selectedInquiryPoint.name}</dd></div><div><dt>Tipo</dt><dd>{INQUIRY_KIND_LABELS[selectedInquiryPoint.kind]}</dd></div><div><dt>{planeDefinition.horizontalAxis}</dt><dd>{fmt(selectedInquiryPoint.point.x, 8)}</dd></div><div><dt>{planeDefinition.verticalAxis}</dt><dd>{fmt(selectedInquiryPoint.point.y, 8)}</dd></div><div><dt>Origine</dt><dd>{selectedInquiryPoint.source}</dd></div>{selectedInquiryPoint.equation && <div><dt>Equazione</dt><dd>{selectedInquiryPoint.equation}</dd></div>}</dl>
               <div className="inspector-actions"><button type="button" className="secondary-button" onClick={() => renameInquiryPoint(selectedInquiryPoint.id)}><PencilRuler size={15} /> Rinomina</button><button type="button" className="danger-button" onClick={() => deleteInquiryPoint(selectedInquiryPoint.id)}><Trash2 size={15} /> Elimina</button></div>
             </> : selectedCurve ? <>
-              <dl><div><dt>Entità</dt><dd>{selectedCurve.name}</dd></div><div><dt>Tipo</dt><dd>{selectedCurve.type === "function" ? "Funzione esplicita" : selectedCurve.type === "implicit" ? "Equazione implicita" : "Curva parametrica"}</dd></div><div><dt>Campioni</dt><dd>{selectedGeometry?.points.length ?? 0}</dd></div><div><dt>Stato</dt><dd className={selectedCurveError ? "bad" : "good"}>{selectedCurveError ? "Errore" : "Valida"}</dd></div>{inspection?.curveId === selectedCurve.id && <><div><dt>Punto X / Y</dt><dd>{fmt(inspection.point.x, 4)} / {fmt(inspection.point.y, 4)}</dd></div><div><dt>Tangente</dt><dd>{fmt(inspection.angle * 180 / Math.PI, 3)}°</dd></div><div><dt>Pendenza</dt><dd>{Number.isFinite(inspection.slope) ? fmt(inspection.slope, 5) : "Verticale"}</dd></div></>}</dl>
+              <dl><div><dt>Entità</dt><dd>{selectedCurve.name}</dd></div><div><dt>Tipo</dt><dd>{selectedCurve.type === "function" ? "Funzione esplicita" : selectedCurve.type === "implicit" ? "Equazione implicita" : "Curva parametrica"}</dd></div><div><dt>Campioni</dt><dd>{selectedGeometry?.points.length ?? 0}</dd></div><div><dt>Stato</dt><dd className={selectedCurveError ? "bad" : "good"}>{selectedCurveError ? "Errore" : "Valida"}</dd></div>{inspection?.curveId === selectedCurve.id && <><div><dt>Punto {planeDefinition.horizontalAxis} / {planeDefinition.verticalAxis}</dt><dd>{fmt(inspection.point.x, 4)} / {fmt(inspection.point.y, 4)}</dd></div><div><dt>Tangente</dt><dd>{fmt(inspection.angle * 180 / Math.PI, 3)}°</dd></div><div><dt>Pendenza</dt><dd>{Number.isFinite(inspection.slope) ? fmt(inspection.slope, 5) : "Verticale"}</dd></div></>}</dl>
               <div className="inspector-actions"><button type="button" className="secondary-button" disabled={!selectedGeometry?.points.length} onClick={addCurveToPath}><FileCode2 size={15} /> Converti</button><button type="button" className="danger-button" onClick={deleteSelection}><Trash2 size={15} /> Elimina</button></div>
             </> : selectedDrawEntity ? <>
-              <dl><div><dt>Entità</dt><dd>{drawEntityName(selectedDrawEntity)}</dd></div><div><dt>Tipo</dt><dd>{selectedDrawEntity.type}</dd></div>{selectedDrawEntity.type === "circle" && <><div><dt>Centro X</dt><dd>{fmt(selectedDrawEntity.c.x, 6)}</dd></div><div><dt>Centro Y</dt><dd>{fmt(selectedDrawEntity.c.y, 6)}</dd></div><div><dt>Raggio</dt><dd>{fmt(selectedDrawEntity.r, 6)}</dd></div><div><dt>Diametro</dt><dd>{fmt(selectedDrawEntity.r * 2, 6)}</dd></div></>}<div><dt>Stato</dt><dd className="good">Selezionata</dd></div></dl>
+              <dl><div><dt>Entità</dt><dd>{drawEntityName(selectedDrawEntity)}</dd></div><div><dt>Tipo</dt><dd>{selectedDrawEntity.type}</dd></div>{selectedDrawEntity.type === "circle" && <><div><dt>Centro {planeDefinition.horizontalAxis}</dt><dd>{fmt(selectedDrawEntity.c.x, 6)}</dd></div><div><dt>Centro {planeDefinition.verticalAxis}</dt><dd>{fmt(selectedDrawEntity.c.y, 6)}</dd></div><div><dt>Raggio</dt><dd>{fmt(selectedDrawEntity.r, 6)}</dd></div><div><dt>Diametro</dt><dd>{fmt(selectedDrawEntity.r * 2, 6)}</dd></div></>}<div><dt>Stato</dt><dd className="good">Selezionata</dd></div></dl>
               <div className="inspector-actions">{selectedDrawEntity.type !== "point" && <button type="button" className="secondary-button" onClick={addDrawEntityToPath}><FileCode2 size={15} /> Converti</button>}<button type="button" className="danger-button" onClick={deleteSelection}><Trash2 size={15} /> Elimina</button></div>
             </> : <p className="muted-copy">Seleziona una curva, una retta, un cerchio o un punto nell’area grafica.</p>}
           </div>
@@ -3075,8 +3174,8 @@ export default function AnalyticCad() {
       <footer className="statusbar">
         <div className="status-message"><span className="online-dot" /> {status}</div>
         <div className="snap-readout"><b>SNAP</b>{snapHit ? snapHit.kind : "—"}</div>
-        <div className="coordinate-readout"><span>X <b>{fmt(cursorWorld.x, 4)}</b></span><span>Y <b>{fmt(cursorWorld.y, 4)}</b></span><span>Z <b>0.0000</b></span></div>
-        <div className="unit-readout">G21 · mm</div>
+        <div className="coordinate-readout"><span>X <b>{fmt(cursorMachine.X, 4)}</b></span><span>Y <b>{fmt(cursorMachine.Y, 4)}</b></span><span>Z <b>{fmt(cursorMachine.Z, 4)}</b></span></div>
+        <div className="unit-readout">{planeDefinition.gCode} · {workPlane} · mm</div>
       </footer>
 
       <nav className="mobile-nav" aria-label="Pannelli applicazione">
@@ -3091,9 +3190,9 @@ export default function AnalyticCad() {
       }} />
 
       {showPresets && <Modal title="Nuova entità matematica" icon={<Sigma size={19} />} onClose={() => setShowPresets(false)}>
-        <p className="modal-intro">Scegli una formula nota oppure crea un’entità libera. Tutti i valori sono modificabili dopo l’inserimento.</p>
+        <p className="modal-intro">Piano attivo <b>{workPlane}</b>: usa le coordinate {planeDefinition.horizontalAxis.toLowerCase()} e {planeDefinition.verticalAxis.toLowerCase()}. Tutti i valori restano modificabili dopo l’inserimento.</p>
         <div className="preset-grid">
-          {PRESETS.map((preset) => <button type="button" key={preset.name} onClick={() => addCurve(preset)}><span className="preset-icon"><LineChart size={20} /></span><strong>{preset.name}</strong><code>{preset.note}</code></button>)}
+          {PRESETS.map((preset) => <button type="button" key={preset.name} onClick={() => addCurve(preset)}><span className="preset-icon"><LineChart size={20} /></span><strong>{preset.name}</strong><code>{remapPlaneExpression(preset.note, "XY", workPlane)}</code></button>)}
         </div>
         <button type="button" className="secondary-button full" onClick={() => addCurve()}><Plus size={16} /> Formula libera y=f(x)</button>
       </Modal>}
@@ -3102,22 +3201,23 @@ export default function AnalyticCad() {
         <div className="guide-intro"><div><BookOpen size={28} /><span><b>GT.Code Analytic CAD v{VERSION}</b><small>Guida operativa integrata</small></span></div><p>Usa i menu superiori per trovare tutte le funzioni oppure la barra verticale destra per i comandi grafici più frequenti.</p></div>
         <div className="guide-grid">
           <section><span className="help-number">01</span><div><h3>Orientarsi nell’interfaccia</h3><p><b>Sinistra:</b> formule e dominio. <b>Centro:</b> canvas CAD. <b>Destra:</b> strumenti verticali e risultati. Su iPhone i pannelli Formule, Disegno, Risultati e G-code si aprono lateralmente.</p></div></section>
-          <section><span className="help-number">02</span><div><h3>Inserire formule</h3><p>Dal menu <b>Formule → Nuova formula</b>: esplicita <code>y=2*x+5</code>, implicita <code>x^2+y^2=900</code>, parametrica <code>x=20*cos(t); y=20*sin(t)</code>. Imposta dominio X/Y e tolleranza prima di calcolare le intersezioni.</p></div></section>
+          <section><span className="help-number">02</span><div><h3>Inserire formule</h3><p>Nel piano <b>{workPlane}</b>: esplicita <code>{remapPlaneExpression("y=2*x+5", "XY", workPlane)}</code>, implicita <code>{remapPlaneExpression("x^2+y^2=900", "XY", workPlane)}</code>, parametrica <code>{remapPlaneExpression("x=20*cos(t); y=20*sin(t)", "XY", workPlane)}</code>. Imposta dominio e tolleranza prima delle intersezioni.</p></div></section>
           <section><span className="help-number">03</span><div><h3>Retta con shell</h3><p>Scegli <b>Disegno → Retta con coordinate</b>. Metodo <b>Due punti</b>: compila P1 e P2. Metodo <b>Punto + angolo</b>: compila P1, angolo in gradi e lunghezza. Puoi digitare X/Y oppure usare <b>Acquisisci</b>.</p></div></section>
           <section><span className="help-number">04</span><div><h3>Cerchio con shell</h3><p>Metodi disponibili: <b>tre punti noti</b>; <b>centro + due punti equidistanti</b>; <b>centro + tangenza</b>; <b>tangenze + raggio</b>; <b>tangenze + diametro</b>. Il centro, il raggio e i punti di contatto vengono calcolati automaticamente.</p></div></section>
-          <section><span className="help-number">05</span><div><h3>Tastiera CAD</h3><p>Tocca un campo X, Y, angolo o lunghezza. Il tastierino modifica quel campo e include numeri, virgola decimale, <b>segno meno −</b>, cancella carattere e pulizia completa. Sono accettati sia punto sia virgola decimale.</p></div></section>
+          <section><span className="help-number">05</span><div><h3>Tastiera CAD</h3><p>Tocca un campo {planeDefinition.horizontalAxis}, {planeDefinition.verticalAxis}, angolo o lunghezza. Il tastierino include numeri, virgola decimale, <b>segno meno −</b>, cancella carattere e pulizia completa. Sono accettati sia punto sia virgola.</p></div></section>
           <section><span className="help-number">06</span><div><h3>Tangenze T1–T4</h3><p>Per un cerchio T-T-R o T-T-Ø seleziona <b>Tangenza 1</b> e <b>Tangenza 2</b> toccando le rette. Puoi aggiungere T3 e T4 come vincoli facoltativi. Le soluzioni S1–S4 sono visibili sul canvas: scegli il cerchio desiderato dai pulsanti oppure direttamente sul disegno.</p></div></section>
           <section><span className="help-number">07</span><div><h3>Selezione e taglio</h3><p>Con la freccia tocca una curva o entità: diventa arancione. Il cestino la elimina. Con le forbici tocca la porzione delimitata dalle intersezioni da rimuovere; usa <b>Annulla</b> o “Ripristina formula” per tornare indietro.</p></div></section>
           <section><span className="help-number">08</span><div><h3>Zoom e interrogazione</h3><p>Rotella o pinch per zoom, Panoramica per spostarsi, Zoom finestra per inquadrare un’area e doppio tocco per adattare tutto. La selezione di una curva mostra coordinate, pendenza e direzione della tangente.</p></div></section>
-          <section><span className="help-number">09</span><div><h3>Percorso e G-code</h3><p>Converti una curva o entità selezionata in punti, controlla ordine e verso, poi apri <b>CNC → Postprocessor Fanuc</b>. Configura G54–G59, utensile, mandrino, avanzamenti, Z sicurezza e Z lavoro prima di esportare il file <code>.NC</code>.</p></div></section>
+          <section><span className="help-number">09</span><div><h3>Percorso e G-code</h3><p>Converti una curva in punti e apri <b>CNC → Postprocessor Fanuc</b>. Configura piano, G54–G59, utensile, mandrino, avanzamenti, quota di sicurezza e quota lavoro sull’asse normale prima di esportare il file <code>.NC</code>.</p></div></section>
           <section><span className="help-number">10</span><div><h3>Salvare su iPhone</h3><p><b>File → Salva progetto</b> produce un file <code>.gtcad</code>. <b>File → Salva report punti intersezione</b> produce invece un <code>.txt</code> con nomi, coordinate, sorgenti ed equazioni. Nel menu Condividi scegli <b>Salva su File</b>, quindi iCloud Drive.</p></div></section>
           <section><span className="help-number">11</span><div><h3>Acquisizione a schermo libero</h3><p>Quando premi <b>Acquisisci</b>, “Seleziona retta” o “Scegli soluzione”, la shell si riduce automaticamente per liberare il canvas. Appena tocchi il punto, la tangenza o la soluzione corretta, la finestra completa riappare con il dato acquisito.</p></div></section>
-          <section><span className="help-number">12</span><div><h3>Interrogare una circonferenza</h3><p>Dal menu <b>Interroga</b> scegli <b>Interroga curva</b>, <b>Interroga centro</b> oppure <b>Interroga tangenze</b>, quindi tocca il bordo del cerchio. Il pannello Proprietà mostra centro X/Y, raggio, diametro e punti nominati.</p></div></section>
+          <section><span className="help-number">12</span><div><h3>Interrogare una circonferenza</h3><p>Dal menu <b>Interroga</b> scegli curva, centro o tangenze e tocca il bordo del cerchio. Il pannello Proprietà mostra il centro in {planeDefinition.horizontalAxis}/{planeDefinition.verticalAxis}, raggio, diametro e punti nominati.</p></div></section>
           <section><span className="help-number">13</span><div><h3>Snap dinamici</h3><p><b>Fine</b>, <b>Medio</b>, <b>Centro</b>, <b>Intersezione</b>, <b>Vicino</b> e <b>Tangente</b> si attivano dalla shell, dal menu Snap o dal pannello Disegno. Durante “Acquisisci”, il punto agganciato riempie automaticamente X e Y.</p></div></section>
           <section><span className="help-number">14</span><div><h3>Interrogare le tangenze</h3><p>Scegli <b>Interroga → Interroga tangenze</b> e tocca il cerchio. L’app confronta il raggio con la distanza perpendicolare di ogni retta dal centro, evidenzia le rette tangenti e marca i contatti come <b>TG1, TG2…</b>.</p></div></section>
           <section><span className="help-number">15</span><div><h3>Punti nominati</h3><p>Le intersezioni diventano <b>I1…</b>, i punti liberi <b>P1…</b>, i punti sulle curve <b>Q1…</b> e i centri <b>C1…</b>. Apri <b>Risultati → Punti interrogati</b> per centrare, rinominare o eliminare ogni punto.</p></div></section>
           <section><span className="help-number">16</span><div><h3>Creare un’equazione</h3><p>Scegli <b>Interroga → Crea equazione di geometria analitica</b> e tocca una retta o una circonferenza disegnata. Viene creata automaticamente una nuova equazione implicita modificabile nel pannello Formule.</p></div></section>
           <section><span className="help-number">17</span><div><h3>Annulla e ritorna</h3><p>Le frecce curve nell’intestazione eseguono <b>Annulla</b> e <b>Ripristina</b>. Su tastiera puoi usare <code>Ctrl/⌘+Z</code>, <code>Ctrl/⌘+Shift+Z</code> oppure <code>Ctrl+Y</code>. Anche i punti interrogati fanno parte della cronologia.</p></div></section>
+          <section><span className="help-number">18</span><div><h3>Piani XY, XZ e YZ</h3><p>Il menu <b>Piano</b> associa il profilo a XY/G17, XZ/G18 o YZ/G19 e rimappa automaticamente formule, coordinate e G-code. L’asse normale è rispettivamente Z, Y o X. Il codice piano <b>non orienta fisicamente la testa</b>: eventuali B/C, TCP o testa angolare vanno gestiti a parte.</p></div></section>
         </div>
         <div className="safety-note"><Info size={18} /><p><strong>Nota CNC:</strong> il programma è un risultato geometrico, non una validazione tecnologica. Verificare origine, Z, utensile, compensazione, staffaggio e collisioni sul controllo/simulatore prima dell’esecuzione.</p></div>
       </Modal>}
@@ -3138,11 +3238,19 @@ export default function AnalyticCad() {
             <div className="post-section-title">Programma</div>
             <label className="text-field"><span>Numero O</span><input value={post.program} inputMode="numeric" onChange={(event) => setPost((current) => ({ ...current, program: event.target.value.replace(/\D/g, "").slice(0, 4) }))} /></label>
             <label className="text-field"><span>Commento</span><input value={post.comment} onChange={(event) => setPost((current) => ({ ...current, comment: event.target.value }))} /></label>
+            <div className="post-section-title">Piano di lavoro</div>
+            <div className="plane-selector" role="radiogroup" aria-label="Piano di lavoro CNC">
+              {(["XY", "XZ", "YZ"] as WorkPlane[]).map((plane) => {
+                const definition = PLANE_DEFINITIONS[plane];
+                return <button type="button" role="radio" aria-checked={workPlane === plane} className={workPlane === plane ? "active" : ""} key={plane} onClick={() => changeWorkPlane(plane)}><b>{plane}</b><span>{definition.gCode}</span><small>normale {definition.normalAxis}</small></button>;
+              })}
+            </div>
+            <div className="plane-map-card"><span>Profilo</span><b>{planeDefinition.horizontalAxis} / {planeDefinition.verticalAxis}</b><span>Asse ingresso e sicurezza</span><b>{planeDefinition.normalAxis}</b></div>
             <div className="post-fields-grid">
-              <NumberField label="Z sicurezza" value={post.safeZ} suffix="mm" onChange={(value) => setPost((current) => ({ ...current, safeZ: value }))} />
-              <NumberField label="Z lavoro" value={post.workZ} suffix="mm" onChange={(value) => setPost((current) => ({ ...current, workZ: value }))} />
-              <NumberField label="F XY" value={post.feedXY} suffix="mm/min" onChange={(value) => setPost((current) => ({ ...current, feedXY: value }))} />
-              <NumberField label="F Z" value={post.feedZ} suffix="mm/min" onChange={(value) => setPost((current) => ({ ...current, feedZ: value }))} />
+              <NumberField label={`${planeDefinition.normalAxis} sicurezza`} value={post.safeZ} suffix="mm" onChange={(value) => setPost((current) => ({ ...current, safeZ: value }))} />
+              <NumberField label={`${planeDefinition.normalAxis} lavoro`} value={post.workZ} suffix="mm" onChange={(value) => setPost((current) => ({ ...current, workZ: value }))} />
+              <NumberField label={`F percorso ${workPlane}`} value={post.feedXY} suffix="mm/min" onChange={(value) => setPost((current) => ({ ...current, feedXY: value }))} />
+              <NumberField label={`F ingresso ${planeDefinition.normalAxis}`} value={post.feedZ} suffix="mm/min" onChange={(value) => setPost((current) => ({ ...current, feedZ: value }))} />
               <NumberField label="Mandrino" value={post.spindle} suffix="rpm" onChange={(value) => setPost((current) => ({ ...current, spindle: value }))} />
               <NumberField label="Utensile T" value={post.tool} min={1} step={1} onChange={(value) => setPost((current) => ({ ...current, tool: value }))} />
             </div>
@@ -3155,12 +3263,12 @@ export default function AnalyticCad() {
             </div>
           </div>
           <div className="code-preview-wrap">
-            <div className="code-preview-head"><div><span className="code-dot red" /><span className="code-dot amber" /><span className="code-dot green" /></div><span>O{sanitizeProgram(post.program)}.NC · FANUC</span><button type="button" onClick={copyGCode}><Copy size={14} /> Copia</button></div>
+            <div className="code-preview-head"><div><span className="code-dot red" /><span className="code-dot amber" /><span className="code-dot green" /></div><span>O{sanitizeProgram(post.program)}.NC · {workPlane}/{planeDefinition.gCode}</span><button type="button" onClick={copyGCode}><Copy size={14} /> Copia</button></div>
             <pre className="code-preview">{gcode}</pre>
             <div className="code-actions"><button type="button" className="secondary-button" onClick={copyGCode}><Copy size={16} /> Copia</button><button type="button" className="primary-button" disabled={pathPoints.length < 2} onClick={exportGCode}><Share2 size={16} /> Salva / Condividi .NC</button></div>
           </div>
         </div>
-        <div className="safety-strip"><Info size={17} /><span>Output geometrico G0/G1 in G21 · G17 · G90. Nessuna compensazione raggio o verifica collisioni automatica.</span></div>
+        <div className="safety-strip"><Info size={17} /><span>Output G0/G1 in G21 · {planeDefinition.gCode} · G90. {planeDefinition.gCode} seleziona il piano ma non orienta testa/utensile: verificare B/C, TCP o testa angolare, origine, compensazioni e collisioni.</span></div>
       </Modal>}
     </main>
   );
@@ -3232,12 +3340,13 @@ function TopMenuBar({ menus }: { menus: AppMenu[] }) {
 }
 
 function ConstructionShell({
-  kind, lineMethod, setLineMethod, circleMethod, setCircleMethod, values, updateValue, activeField, setActiveField,
+  kind, plane, lineMethod, setLineMethod, circleMethod, setCircleMethod, values, updateValue, activeField, setActiveField,
   pickTarget, onPickPoint, tangentLine, tangentLines, tangentSlotCount, tangentPickTarget, onPickTangentLine,
   onClearTangent, onAddTangent, onRemoveTangent, solutionIndex, onSelectSolution, onPickSolution,
   snaps, setSnaps, result, minimized, acquisitionText, onCancelAcquisition, onCreate, onClose,
 }: {
   kind: "line" | "circle";
+  plane: WorkPlane;
   lineMethod: LineMethod; setLineMethod: (method: LineMethod) => void;
   circleMethod: CircleMethod; setCircleMethod: (method: CircleMethod) => void;
   values: ConstructionValues; updateValue: (field: ConstructionField, value: string) => void;
@@ -3255,6 +3364,7 @@ function ConstructionShell({
   minimized: boolean; acquisitionText: string; onCancelAcquisition: () => void;
   onCreate: () => void; onClose: () => void;
 }) {
+  const definition = PLANE_DEFINITIONS[plane];
   const numericField = (field: ConstructionField, label: string, suffix?: string) => <label className={`shell-number-field ${activeField === field ? "active" : ""}`}>
     <span>{label}</span>
     <span><input
@@ -3269,10 +3379,10 @@ function ConstructionShell({
   </label>;
 
   const pointEditor = (field: PointField, title: string) => <section className={`shell-point-editor ${pickTarget === field ? "picking" : ""}`}>
-    <header><div><b>{title}</b><code>{coordinatePair(values, field)}</code></div><button type="button" onClick={() => onPickPoint(field)}><MousePointerClick size={15} /> {pickTarget === field ? "Tocca il canvas…" : "Acquisisci"}</button></header>
+    <header><div><b>{title}</b><code>{coordinatePair(values, field, plane)}</code></div><button type="button" onClick={() => onPickPoint(field)}><MousePointerClick size={15} /> {pickTarget === field ? "Tocca il canvas…" : "Acquisisci"}</button></header>
     <div className="shell-coordinate-grid">
-      {numericField(`${field}x` as ConstructionField, "X")}
-      {numericField(`${field}y` as ConstructionField, "Y")}
+      {numericField(`${field}x` as ConstructionField, definition.horizontalAxis)}
+      {numericField(`${field}y` as ConstructionField, definition.verticalAxis)}
     </div>
   </section>;
 
@@ -3287,7 +3397,7 @@ function ConstructionShell({
   };
 
   const lineDescription = (line: Extract<DrawEntity, { type: "line" }> | null) => line
-    ? `P1 ${fmt(line.a.x, 3)}, ${fmt(line.a.y, 3)} → P2 ${fmt(line.b.x, 3)}, ${fmt(line.b.y, 3)}`
+    ? `P1 ${formatPlanePoint(line.a, plane, 3)} → P2 ${formatPlanePoint(line.b, plane, 3)}`
     : "Nessuna retta selezionata";
 
   const tangencyEditor = (slot: number) => {
@@ -3306,9 +3416,9 @@ function ConstructionShell({
   const fixedTangencies = circleMethod === "tangencies-radius" || circleMethod === "tangencies-diameter";
   const selectedSolution = result.candidates?.length ? ((solutionIndex % result.candidates.length) + result.candidates.length) % result.candidates.length : 0;
   const summary = geometry?.type === "line"
-    ? `P2 ${fmt(geometry.b.x, 5)}, ${fmt(geometry.b.y, 5)} · L ${fmt(distance(geometry.a, geometry.b), 5)}`
+    ? `P2 ${formatPlanePoint(geometry.b, plane, 5)} · L ${fmt(distance(geometry.a, geometry.b), 5)}`
     : geometry?.type === "circle"
-      ? `${fixedTangencies ? `S${selectedSolution + 1} · ` : ""}C ${fmt(geometry.c.x, 5)}, ${fmt(geometry.c.y, 5)} · R ${fmt(geometry.r, 5)} · Ø ${fmt(geometry.r * 2, 5)}`
+      ? `${fixedTangencies ? `S${selectedSolution + 1} · ` : ""}C ${formatPlanePoint(geometry.c, plane, 5)} · R ${fmt(geometry.r, 5)} · Ø ${fmt(geometry.r * 2, 5)}`
       : result.error ?? "Compila i dati geometrici";
 
   return <aside className={`construction-shell ${minimized ? "minimized" : ""}`} aria-label={`Shell ${kind === "line" ? "retta" : "cerchio"}`}>
@@ -3394,14 +3504,17 @@ function GCodePanel({ pathPoints, setPathPoints, post, setPost, gcode, checks, o
   pathPoints: Point[]; setPathPoints: React.Dispatch<React.SetStateAction<Point[]>>; post: PostSettings; setPost: React.Dispatch<React.SetStateAction<PostSettings>>;
   gcode: string; checks: { invalid: number; maxMove: number; minMove: number }; onExport: () => void; onCopy: () => void; onOpen: () => void;
 }) {
+  const plane = normalizeWorkPlane(post.plane);
+  const definition = PLANE_DEFINITIONS[plane];
   return <div className="gcode-side-content">
+    <div className="plane-side-badge"><span>PIANO</span><b>{plane} · {definition.gCode}</b><small>profilo {definition.horizontalAxis}/{definition.verticalAxis} · normale {definition.normalAxis}</small></div>
     <div className="path-summary"><div><span>PUNTI</span><strong>{pathPoints.length}</strong></div><div><span>L MAX</span><strong>{fmt(checks.maxMove, 2)}</strong></div><div><span>STATO</span><strong className={checks.invalid ? "bad" : "good"}>{pathPoints.length >= 2 && !checks.invalid ? "OK" : "—"}</strong></div></div>
     <div className="path-actions"><button type="button" onClick={() => setPathPoints((current) => [...current].reverse())} disabled={pathPoints.length < 2}><RotateCcw size={14} /> Inverti</button><button type="button" onClick={() => setPathPoints([])} disabled={!pathPoints.length}><Trash2 size={14} /> Svuota</button></div>
     <label className="toggle-row slim"><span><RotateCcw size={15} /><b>Chiudi profilo</b></span><input type="checkbox" checked={post.closePath} onChange={(event) => setPost((current) => ({ ...current, closePath: event.target.checked }))} /></label>
     <pre className="side-code-preview">{gcode}</pre>
     <button type="button" className="primary-button full" onClick={onOpen}><Settings2 size={15} /> Configura postprocessor</button>
     <div className="split-buttons"><button type="button" className="secondary-button" onClick={onCopy}><Copy size={15} /> Copia</button><button type="button" className="secondary-button" disabled={pathPoints.length < 2} onClick={onExport}><FileDown size={15} /> .NC</button></div>
-    <p className="micro-warning">Verificare sempre origine, quote Z, utensile e traiettoria sul simulatore CNC.</p>
+    <p className="micro-warning">Verificare origine, quota {definition.normalAxis}, orientamento utensile e traiettoria sul simulatore CNC.</p>
   </div>;
 }
 
