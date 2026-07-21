@@ -1,6 +1,23 @@
-# GT.Code Analytic CAD v1.4.1
+# GT.Code Analytic CAD v1.5.0
 
-Applicazione CAD matematica 2D eseguita interamente nel browser. Permette di inserire funzioni esplicite, equazioni implicite e curve parametriche, calcolare intersezioni numeriche, disegnare entità semplici con snap e trasformare punti o curve campionate in G-code Fanuc G0/G1.
+Applicazione CAD matematica 2D eseguita interamente nel browser. Permette di inserire funzioni esplicite, equazioni implicite e curve parametriche, calcolare intersezioni numeriche, disegnare entità semplici con snap e trasformare punti o curve campionate in G-code Fanuc G0/G1 sui piani XY, XZ e YZ.
+
+## Novità v1.5.0
+
+- nuovo menu `Piano` e selettore nel postprocessor per lavorare in `XY / G17`, `XZ / G18` o `YZ / G19`;
+- rimappatura automatica delle coordinate, delle formule, delle quote, dei dettagli delle entità e dei report quando cambia il piano;
+- postprocessor consapevole del piano: movimenti del profilo sui due assi selezionati e avvicinamento/allontanamento sull'asse normale;
+- costruzioni geometriche, intersezioni e cerchi tangenti a rette anche inclinate invariati matematicamente e convertiti negli assi fisici del piano scelto;
+- progetti precedenti compatibili: in assenza dell'impostazione il piano resta `XY / G17`;
+- test automatici aggiunti per trasformazioni di coordinate, formule, report, tangenze inclinate e programmi G-code su tutti e tre i piani.
+
+| Piano | Codice | Assi del profilo | Asse normale / quota sicurezza |
+| --- | --- | --- | --- |
+| XY | G17 | X, Y | Z |
+| XZ | G18 | X, Z | Y |
+| YZ | G19 | Y, Z | X |
+
+`G17`, `G18` e `G19` selezionano il piano di interpolazione ma non orientano fisicamente mandrino, testa o utensile. Eventuali assi B/C, testa angolare, TCP e trasformazioni cinematiche macchina devono essere impostati e verificati separatamente. Il post attuale linearizza il profilo con blocchi G0/G1 e mantiene fissa la quota dell'asse normale durante il taglio: non genera una lavorazione simultanea 3D, compensazione raggio utensile o controllo collisioni.
 
 ## Correzione v1.4.1
 
@@ -29,7 +46,7 @@ Applicazione CAD matematica 2D eseguita interamente nel browser. Permette di ins
 
 ## Novità v1.2.0
 
-- menu superiori a tendina in stile applicazione desktop (`File`, `Modifica`, `Disegno`, `Interroga`, `Formule`, `Vista`, `Snap`, `CNC`, `Aiuto`);
+- menu superiori a tendina in stile applicazione desktop (`File`, `Modifica`, `Disegno`, `Interroga`, `Formule`, `Piano`, `Vista`, `Snap`, `CNC`, `Aiuto`);
 - shell di costruzione per rette definite da due punti oppure da punto, angolo e lunghezza;
 - shell di costruzione per cerchi passanti per tre punti, con centro e due punti equidistanti, oppure con centro e tangenza automatica a una retta selezionata;
 - acquisizione dei punti direttamente dal canvas con snap dinamici a estremità, punti medi, centri, intersezioni, punti vicini e tangenze;
@@ -85,4 +102,4 @@ https://NOME-UTENTE.github.io/NOME-REPOSITORY/
 
 ## Sicurezza CNC
 
-Il G-code generato è un risultato geometrico. Prima dell'esecuzione verificare sempre origine pezzo, unità, quote Z, utensile, avanzamenti, staffaggio, direzione, compensazioni e collisioni su un simulatore o sul controllo macchina in modalità sicura.
+Il G-code generato è un risultato geometrico. Prima dell'esecuzione verificare sempre origine pezzo, unità, piano attivo, quota dell'asse normale, orientamento reale dell'utensile, avanzamenti, staffaggio, direzione, compensazioni e collisioni su un simulatore o sul controllo macchina in modalità sicura.
